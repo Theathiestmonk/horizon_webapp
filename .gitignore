@@ -1,0 +1,32 @@
+# Environment
+.env
+.env.*
+
+# Service account credentials
+service_account.json
+*.json.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Generated documents
+output/
+!output/.gitkeep
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

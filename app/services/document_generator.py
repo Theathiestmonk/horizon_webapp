@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 TEMPLATE_DIR = Path("templates")
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+BASE_DOWNLOAD_URL = os.getenv("BASE_DOWNLOAD_URL", "http://localhost:8080/output").rstrip("/")
 
 # Maps each DOCX template to the description field it should use from Item
 TEMPLATE_DESC_FIELD = {
@@ -234,7 +235,7 @@ def generate_document(template_name: str, payload: Any, invoice_no: str) -> Dict
             "template": template_name,
             "output_file": str(output_path),
             "download_name": output_filename,
-            "download_url": f"/output/{output_filename}",
+            "download_url": f"{BASE_DOWNLOAD_URL}/{output_filename}",
         }
   
     except Exception as e:

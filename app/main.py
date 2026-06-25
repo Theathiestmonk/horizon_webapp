@@ -4,7 +4,15 @@ Main FastAPI application for Horizon Export Document Generator.
 """
 
 import logging
+import os
 from pathlib import Path
+
+# Load .env BEFORE any other imports so os.getenv() calls in sub-modules get the values.
+# Use explicit path so this works regardless of cwd (uvicorn app.main:app vs python main.py).
+from dotenv import load_dotenv
+_env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(dotenv_path=_env_path, override=True)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -55,7 +63,9 @@ async def root():
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Horizon v5.1 starting up...")
+    logger.info(
+        "Horizon v5.1 starting up | local output mode enabled"
+    )
 
 if __name__ == "__main__":
     import uvicorn

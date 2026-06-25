@@ -11,12 +11,14 @@ router = APIRouter()
 BASE_DOWNLOAD_URL = os.getenv('BASE_DOWNLOAD_URL', 'http://localhost:8080/output')
 
 DOCUMENT_MAP = {
+    "proforma_invoice": "PI FORMAT.docx",
     "commercial_invoice": "Commercial_Invoice.docx",
     "packing_list": "Packing_List.docx",
     "annexure_1": "Annexure_1.docx",
     "tax_invoice": "Tax_Invoice.docx",
     "annexure_c": "Annexure_C.docx",
     "scomet": "SCOMET_Declaration.docx",
+    "dbk": "DBK_Declaration.docx",
     "vintage": "Vintage_Car_Declaration.docx",
 }
 
@@ -48,12 +50,15 @@ async def generate_documents(
             continue
 
         template_name = DOCUMENT_MAP[doc_key]
-        result = generate_document(template_name=template_name, payload=payload, invoice_no=invoice_no)
+        result = generate_document(
+            template_name=template_name,
+            payload=payload,
+            invoice_no=invoice_no,
+        )
 
         if result.get("status") == "success":
             download_name = result["download_name"]
-            # Prefer Drive URL; fall back to local HTTP URL if upload failed
-            file_url = result.get("drive_url") or f"{BASE_DOWNLOAD_URL}/{download_name}"
+            file_url = result.get("download_url") or f"{BASE_DOWNLOAD_URL}/{download_name}"
             generated_files.append({
                 "template": doc_key,
                 "document": template_name,
@@ -71,9 +76,49 @@ async def generate_documents(
     return {
         "status": status,
         "invoice_no": invoice_no,
-        # generated_files is what GAS showDownloadDialog reads
         "generated_files": generated_files,
         "failed": failed,
+    }
+
+
+@router.post("/generate/pi")
+async def generate_pi_document(
+    invoice_no: str = Query(..., description="Invoice number"),
+    payload: HorizonPayload = Body(...),
+):
+    """Generate PI FORMAT (Proforma Invoice) only — called by GAS generatePIDocument()."""
+    logger.info(f"[{invoice_no}] PI-only generation | vehicles={len(payload.vehicles)} | items={len(payload.items)}")
+
+    for i, item in enumerate(payload.items):
+        d = item.model_dump()
+        logger.info(f"[{invoice_no}] item[{i}]: hsn={d.get('hsn_code')} qty={d.get('quantity')} desc_pi='{d.get('description_pi')}' desc='{d.get('description')}'")
+    for i, v in enumerate(payload.vehicles):
+        d = v.model_dump()
+        logger.info(f"[{invoice_no}] vehicle[{i}]: chassis={d.get('chassis_no')} model='{d.get('model')}' price={d.get('unit_price_usd')}")
+
+    result = generate_document(
+        template_name="PI FORMAT.docx",
+        payload=payload,
+        invoice_no=invoice_no,
+    )
+
+    if result.get("status") != "success":
+        raise HTTPException(status_code=500, detail={"error": result.get("error", "Generation failed"), "template": "PI FORMAT.docx"})
+
+    download_name = result["download_name"]
+    file_url = result.get("download_url") or f"{BASE_DOWNLOAD_URL}/{download_name}"
+
+    return {
+        "status": "success",
+        "invoice_no": invoice_no,
+        "generated_files": [{
+            "template": "proforma_invoice",
+            "document": "PI FORMAT.docx",
+            "download_name": download_name,
+            "gcs_url": file_url,
+            "output_file": result.get("output_file", ""),
+        }],
+        "failed": [],
     }
 
 
@@ -118,7 +163,6 @@ async def cha_package(invoice_no: str):
         "status": "success",
         "invoice_no": invoice_no,
         "package_files": package_files,
-        # GAS checks drive_folder_url — point to our local listing
         "drive_folder_url": f"{BASE_DOWNLOAD_URL}/?invoice={invoice_no}",
         "folder_url": f"{BASE_DOWNLOAD_URL}/?invoice={invoice_no}",
         "generated_files": package_files,

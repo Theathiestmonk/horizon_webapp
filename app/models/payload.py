@@ -8,6 +8,12 @@ class Item(BaseModel):
     model_config = ConfigDict(extra='allow')
     hsn_code: str = ""
     description: str = ""
+    description_commercial: str = ""
+    description_scomet: str = ""
+    description_packing: str = ""
+    description_tax: str = ""
+    description_pi: str = ""
+    description_annexure1: str = ""
     quantity: int = 0
     rate_per_unit: float = 0.0
     amount_usd: float = 0.0
@@ -92,7 +98,7 @@ class Buyer(BaseModel):
     country: str = ""
 
 class HorizonPayload(BaseModel):
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='allow', coerce_numbers_to_str=True)
     invoice_no: str
     invoice_date: str = ""
     mode: str = "FINAL"
@@ -118,6 +124,10 @@ class HorizonPayload(BaseModel):
     amount_inr_words: str = ""
     total_fob_usd: float = 0.0
     total_inr: float = 0.0
+    # PI FORMAT fields
+    insurance_ref_no: str = ""
+    delivery_terms: str = ""
+    place_of_receipt: str = ""
 
     @model_validator(mode='after')
     def calculate_totals(self) -> 'HorizonPayload':

@@ -11,7 +11,7 @@ const CFG = {
   containerCell:      'C37',
   portLoadCell:       'C21',
   portDischargeCell:  'F21',
-  finalDestinationCell: 'H22',
+  finalDestinationCell:'H22',
   modeCell:           'F3',
   exchangeRateCell:   'C29',
   igstRateCell:       'F29',
@@ -31,7 +31,7 @@ const CFG = {
   termsOfPaymentCell: 'C23',   // CONTROL C23 = payment terms (e.g. "CIF, 100% TT ADVANCE")
   notifyCell1:        'C14',
   notifyCell2:        'C15',
-  webhookUrl: 'https://drawing-cosmetic-losses-nancy.trycloudflare.com/api/v1/invoices/',
+  webhookUrl: 'https://pointed-constitute-heaven-duke.trycloudflare.com/api/v1/invoices/',
 };
 
 function AMOUNTWORDS(n, curr) {
@@ -54,6 +54,22 @@ function AMOUNTWORDS(n, curr) {
   let result = 'AMOUNT CHARGEABLE IN ' + currText + ' ' + words(whole) + ' ONLY';
   if (cents > 0) result += ' AND PAISE ' + words(cents) + ' ONLY';
   return result;
+}
+
+function normInvoice_(v) {
+  return String(v || '')
+    .replace(/[\u200B\u200C\u200D\uFEFF\u00A0]/g, '')
+    .trim()
+    .toUpperCase();
+}
+
+function sameInvoice_(a, b) {
+  return normInvoice_(a) === normInvoice_(b);
+}
+
+function rowMatchesInvoice_(row, invoiceNo) {
+  if (!row) return false;
+  return sameInvoice_(row[7], invoiceNo) || sameInvoice_(row[18], invoiceNo);
 }
 
 function onOpen() {
@@ -178,7 +194,7 @@ function validate() {
   if (!container) warnings.push('⚠ Container number is empty → cell: C37 (Optional except for Annexure C)');
 
   if (mode === 'FINAL') {
-    const assigned = stock.getRange('A4:H2000').getValues().filter(function(r) { return r[7] === inv; });
+    const assigned = stock.getRange('A4:S2000').getValues().filter(function(r) { return rowMatchesInvoice_(r, inv); });
     if (assigned.length === 0)
       errors.push('⑥ No vehicles assigned to this invoice — use sidebar or Bulk Assign');
     else if (assigned.length !== qty)
@@ -222,8 +238,8 @@ function buildPayload(ss, ctrl, inv) {
   const cif_usd   = Number(ctrl.getRange('C28').getValue()) || 0;
   const total_inr = Number(ctrl.getRange(CFG.totalInrCell).getValue()) || 0;
 
-  const vehicles = stock.getRange('A4:J2000').getValues()
-    .filter(function(r) { return r[7] === inv; })
+  const vehicles = stock.getRange('A4:S2000').getValues()
+    .filter(function(r) { return rowMatchesInvoice_(r, inv); })
     .map(function(r) {
       return {
         chassis_no:     r[0] || '',

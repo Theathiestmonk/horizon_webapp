@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 class Item(BaseModel):
     model_config = ConfigDict(extra='allow')
     hsn_code: str = ""
+    hsn_code_pi: str = ""
     description: str = ""
     description_commercial: str = ""
     description_scomet: str = ""
@@ -14,6 +15,9 @@ class Item(BaseModel):
     description_tax: str = ""
     description_pi: str = ""
     description_annexure1: str = ""
+    description_cha_ti: str = ""
+    description_cha_pl: str = ""
+    description_cha_ci: str = ""
     quantity: int = 0
     rate_per_unit: float = 0.0
     amount_usd: float = 0.0

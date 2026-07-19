@@ -20,6 +20,9 @@ DOCUMENT_MAP = {
     "scomet": "SCOMET_Declaration.docx",
     "dbk": "DBK_Declaration.docx",
     "vintage": "Vintage_Car_Declaration.docx",
+    "cha_tax_invoice": "CHA TI.docx",
+    "cha_packing_list": "CHA PL.docx",
+    "cha_commercial_invoice": "CHA CI.docx",
 }
 
 

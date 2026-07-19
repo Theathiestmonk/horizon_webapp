@@ -22,10 +22,60 @@ TEMPLATE_DESC_FIELD = {
     "SCOMET_Declaration.docx":     "description_scomet",
     "Annexure_C.docx":             "description_scomet",
     "Annexure_1.docx":             "description_annexure1",
+    "CHA TI.docx":                 "description_cha_ti",
+    "CHA PL.docx":                 "description_cha_pl",
+    "CHA CI.docx":                 "description_cha_ci",
 }
 
 def sanitize_filename(name: str) -> str:
     return name.replace("/", "-").replace("\\", "-").replace(" ", "_")
+
+# Monetary + rate fields — exchange_rate keeps its decimals (genuine currency
+# conversion precision), everything else here is always a whole number in
+# practice (GST slabs are 0/5/12/18/28) so it gets rounded to an int so
+# templates never print "1500.0" or "18.0%".
+_MONEY_KEYS_TOP = (
+    'unit_price_usd', 'fob_total_usd', 'freight_usd', 'insurance_usd', 'cif_total_usd',
+    'taxable_value_inr', 'igst_amount_inr', 'total_value_inr', 'total_inr',
+    'total_cif_usd', 'total_fob_usd', 'total_taxable_inr',
+    'igst_rate', 'igst_percent',
+)
+_MONEY_KEYS_ITEM = ('rate_per_unit', 'amount_usd', 'unit_price', 'total')
+_MONEY_KEYS_VEHICLE = ('unit_price_usd',)
+
+# Genuine rates/measurements — real decimals (e.g. 83.45 exchange rate, 600.5
+# kg) must survive untouched, but a value that happens to be a whole number
+# (e.g. 94.0, 3600.0) should still print as "94" / "3600", not "94.0" /
+# "3600.0". So: strip the ".0" only when there's no actual fraction.
+_RATE_KEYS_TOP = (
+    'exchange_rate', 'total_net_weight', 'total_gross_weight', 'net_weight_kg', 'gross_weight_kg'
+)
+
+def _clean_rate(v):
+    return int(v) if isinstance(v, float) and v == int(v) else v
+
+def _round_money(context: Dict[str, Any]) -> None:
+    for key in _MONEY_KEYS_TOP:
+        if isinstance(context.get(key), float):
+            context[key] = int(round(context[key]))
+    for key in _RATE_KEYS_TOP:
+        if key in context:
+            context[key] = _clean_rate(context[key])
+    for it in (context.get('items') or []):
+        if isinstance(it, dict):
+            for key in _MONEY_KEYS_ITEM:
+                if isinstance(it.get(key), float):
+                    it[key] = int(round(it[key]))
+    item_singular = context.get('item')
+    if isinstance(item_singular, dict):
+        for key in _MONEY_KEYS_ITEM:
+            if isinstance(item_singular.get(key), float):
+                item_singular[key] = int(round(item_singular[key]))
+    for v in (context.get('vehicles') or []):
+        if isinstance(v, dict):
+            for key in _MONEY_KEYS_VEHICLE:
+                if isinstance(v.get(key), float):
+                    v[key] = int(round(v[key]))
 
 def convert_to_words(amount: float, currency: str = "INR") -> str:
     try:
@@ -102,10 +152,15 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
     context['igst_percent']      = context.get('igst_rate') or 0
 
     # ── Swap item.description per template ──────────────────────────────────
+    # Always assign (not "only if truthy") — an intentionally blank desc_field
+    # (Invoice_Descriptions collapsing every item but the first down to '' so
+    # a concatenating template prints the text exactly once) must make
+    # `description` blank too, not silently fall back to whatever value it
+    # already held from an earlier per-template pass.
     desc_field = TEMPLATE_DESC_FIELD.get(template_name, "")
     if desc_field and isinstance(context.get('items'), list):
         for it in context['items']:
-            if isinstance(it, dict) and it.get(desc_field):
+            if isinstance(it, dict) and desc_field in it:
                 it['description'] = it[desc_field]
 
     # ── Add aliases + sr_no + unit + package range on each item ────────────
@@ -137,6 +192,40 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
         first['amount_usd'] = sum(it.get('amount_usd', 0) for it in context['items'] if isinstance(it, dict))
         first['total']      = first['amount_usd']
         context['item'] = first
+
+    # ── Swap hsn_code → hsn_code_pi for PI FORMAT (destination country HSN) ─
+    if template_name == "PI FORMAT.docx":
+        for it in (context.get('items') or []):
+            if isinstance(it, dict) and it.get('hsn_code_pi'):
+                it['hsn_code'] = it['hsn_code_pi']
+        item_singular = context.get('item')
+        if isinstance(item_singular, dict) and item_singular.get('hsn_code_pi'):
+            item_singular['hsn_code'] = item_singular['hsn_code_pi']
+
+    # ── PI FORMAT / Tax Invoice — single merged row per invoice ─────────────
+    # These two summarize the whole shipment as one line, not a per-model
+    # breakdown (that's what Commercial Invoice / CHA CI/TI/PL are for).
+    # Quantity and amount are summed across every model/price group; HSN
+    # codes are joined (not silently dropped) when models differ, so the
+    # single row still discloses every code instead of only the first one.
+    if template_name in ("PI FORMAT.docx", "Tax_Invoice.docx") and isinstance(context.get('items'), list) and context['items']:
+        items_list = [it for it in context['items'] if isinstance(it, dict)]
+        if items_list:
+            merged = dict(items_list[0])
+            merged['quantity']   = sum(it.get('quantity', 0) for it in items_list)
+            merged['amount_usd'] = sum(it.get('amount_usd', 0) for it in items_list)
+            merged['total']      = merged['amount_usd']
+            merged['unit_price'] = merged.get('rate_per_unit', 0)
+            hsn_codes = []
+            for it in items_list:
+                code = it.get('hsn_code', '')
+                if code and code not in hsn_codes:
+                    hsn_codes.append(code)
+            merged['hsn_code'] = ' / '.join(hsn_codes)
+            merged['sr_no'] = 1
+            merged['sr_start'] = 1
+            merged['sr_end'] = merged['quantity']
+            context['items'] = [merged]
 
     # ── vin_list for Annexure_1 ({% for v in vin_list %}) ──────────────────
     if isinstance(context.get('vehicles'), list):
@@ -203,6 +292,19 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
         context['amount_inr_words'] = convert_to_words(
             context.get('total_value_inr') or context.get('total_inr') or 0, currency="INR"
         )
+
+    # PI FORMAT's amount cell is a bare {{ amount_usd_words }} with no static
+    # label (unlike CI/CHA CI/CHA TI, which already print their own "AMOUNT
+    # CHARGEABLE..." label before the placeholder) — so PI FORMAT needs the
+    # full phrase baked into the value itself.
+    if template_name == "PI FORMAT.docx":
+        for key in ("amount_usd_words", "amount_inr_words"):
+            val = context.get(key) or ""
+            if val and not val.upper().startswith("AMOUNT CHARGEABLE"):
+                context[key] = f"AMOUNT CHARGEABLE IN {val}"
+
+    # ── Whole-number money — strip ".0" from every USD/INR amount ──────────
+    _round_money(context)
 
     context['generation_timestamp'] = datetime.utcnow().isoformat()
     logger.info(f"[{template_name}] Context built: {len(context)} keys | invoice={context.get('invoice_no')} | items={len(context.get('items') or [])} | vehicles={len(context.get('vehicles') or [])}")

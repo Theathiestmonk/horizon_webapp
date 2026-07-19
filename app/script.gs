@@ -1552,11 +1552,21 @@ function buildPayload(ss, ctrl, inv) {
     // invoice's actual assigned/selected vehicles, never a static manual list.
     it.description_packing = buildPackingListVehicleBlock_(it.description_packing, it.vehicle_list);
 
-    var tiManual = genOverride ? String(genOverride[9] || '').trim() : '';
-    if (!tiManual && lcLine) it.description_cha_ti = lcLine;
-
-    var plManual = genOverride ? String(genOverride[10] || '').trim() : '';
-    if (!plManual && lcLine) it.description_cha_pl = lcLine;
+    // description_cha_ti / description_cha_pl only ever exist to hold ONE
+    // fact: "per LC document no. X dt. Y" for THIS invoice. Unlike Commercial
+    // Invoice/CHA CI (genuinely different, legitimate per-model text, so a
+    // manual override there is real content worth keeping), a Descriptions-
+    // tab entry in these two columns is only ever a placeholder for invoices
+    // that don't have LC info yet — once CONTROL's LC No./Date are filled in,
+    // that live, invoice-specific fact always wins outright, regardless of
+    // whatever static text happens to sit in the Descriptions tab. Both CHA
+    // TI/CHA PL templates render one row PER MODEL GROUP (document_generator.py
+    // copies this field onto every item's own description), so it must be set
+    // on every item, not just the first — leaving it blank on items after the
+    // first (as an earlier version of this did) left every model but the
+    // first with a blank description cell in the actual generated document.
+    if (lcLine) it.description_cha_ti = lcLine;
+    if (lcLine) it.description_cha_pl = lcLine;
 
     var ciChaManual = genOverride ? String(genOverride[11] || '').trim() : '';
     if (!ciChaManual && lcLine) {

@@ -27,6 +27,27 @@ TEMPLATE_DESC_FIELD = {
     "CHA CI.docx":                 "description_cha_ci",
 }
 
+# Maps each DOCX template to which per-item HSN field it should print.
+# Customer-facing documents (CI, PI, Tax Invoice, Packing List) use the
+# customer's own country's HSN code; everything else — SCOMET/Annexure/DBK/
+# Vintage and every CHA document — uses the Indian HSN code, since those are
+# Indian customs/export filings. See the HSN resolution block in
+# buildPayload() (script.gs).
+TEMPLATE_HSN_FIELD = {
+    "PI FORMAT.docx":              "hsn_code_user_country",
+    "Commercial_Invoice.docx":     "hsn_code_user_country",
+    "Tax_Invoice.docx":            "hsn_code_user_country",
+    "Packing_List.docx":           "hsn_code_user_country",
+    "SCOMET_Declaration.docx":     "hsn_code_india",
+    "Annexure_C.docx":             "hsn_code_india",
+    "Annexure_1.docx":             "hsn_code_india",
+    "DBK_Declaration.docx":        "hsn_code_india",
+    "Vintage_Car_Declaration.docx":"hsn_code_india",
+    "CHA TI.docx":                 "hsn_code_india",
+    "CHA PL.docx":                 "hsn_code_india",
+    "CHA CI.docx":                 "hsn_code_india",
+}
+
 def sanitize_filename(name: str) -> str:
     return name.replace("/", "-").replace("\\", "-").replace(" ", "_")
 
@@ -163,6 +184,21 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
             if isinstance(it, dict) and desc_field in it:
                 it['description'] = it[desc_field]
 
+    # ── Swap item.hsn_code per template ──────────────────────────────────────
+    # hsn_code_user_country feeds Commercial_Invoice/Tax_Invoice/Packing_List,
+    # hsn_code_india feeds everything else (SCOMET/Annexure/CHA), hsn_code_pi
+    # feeds PI FORMAT. Each of those 3 fields already falls back to the
+    # existing model-level HSN in buildPayload() (script.gs) when a Stock tab
+    # override is blank, so this only ever changes output once an override
+    # is actually filled in. Runs before context['item'] (singular, below) is
+    # copied from items[0], so PI FORMAT / Tax Invoice's merged single row
+    # picks up the already-swapped value too.
+    hsn_field = TEMPLATE_HSN_FIELD.get(template_name, "")
+    if hsn_field and isinstance(context.get('items'), list):
+        for it in context['items']:
+            if isinstance(it, dict) and it.get(hsn_field):
+                it['hsn_code'] = it[hsn_field]
+
     # ── Add aliases + sr_no + unit + package range on each item ────────────
     _running_item = 0
     for idx, it in enumerate(context.get('items') or []):
@@ -192,15 +228,6 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
         first['amount_usd'] = sum(it.get('amount_usd', 0) for it in context['items'] if isinstance(it, dict))
         first['total']      = first['amount_usd']
         context['item'] = first
-
-    # ── Swap hsn_code → hsn_code_pi for PI FORMAT (destination country HSN) ─
-    if template_name == "PI FORMAT.docx":
-        for it in (context.get('items') or []):
-            if isinstance(it, dict) and it.get('hsn_code_pi'):
-                it['hsn_code'] = it['hsn_code_pi']
-        item_singular = context.get('item')
-        if isinstance(item_singular, dict) and item_singular.get('hsn_code_pi'):
-            item_singular['hsn_code'] = item_singular['hsn_code_pi']
 
     # ── PI FORMAT / Tax Invoice — single merged row per invoice ─────────────
     # These two summarize the whole shipment as one line, not a per-model

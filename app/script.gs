@@ -41,30 +41,45 @@ const CFG = {
   dealerCertNoCell:       'C58',
   dealerCertDateCell:     'F58',
   yearOfManufactureCell:  'C59',
-  webhookUrl: 'https://hayes-latin-theorem-remedies.trycloudflare.com/api/v1/invoices/',
+  // Preferential Trade Agreement code (e.g. NCPTI, ECTAAU) — this is a
+  // per-shipment customs declaration (does the exporter/importer claim a
+  // preferential-tariff benefit for THIS invoice under a specific FTA/PTA?),
+  // not a fixed property of the product/model, so it lives here rather than
+  // on the Products tab. Same product can be NCPTI on one invoice and
+  // ECTAAU on another depending on what's actually claimed for that shipment.
+  // Deliberately shares F26 with unitPriceCell above — user confirmed the
+  // Unit Price (USD) field there is never actually needed (Stock's own
+  // per-vehicle price always takes priority already). Consequence: since
+  // F26 now holds text like "NCPTI" instead of a number, financials.
+  // unit_price_usd in the payload will always resolve to 0 (Number("NCPTI")
+  // || 0) — fine as long as nothing downstream prints that field.
+  prefTradeCodeCell:      'F26',
+  // Invoice Code (e.g. 380000) — same reasoning as prefTradeCodeCell: this
+  // pairs with the Preferential Trade Agreement Code on the CHA CI trailer
+  // (see buildChaCiTrailer_) and is a per-shipment customs value, not a
+  // fixed per-model property, so it moved off the Products tab onto its own
+  // CONTROL cell here rather than being read via genProd[19] anymore.
+  invoiceCodeCell:        'F17',
+  webhookUrl: 'https://weeks-concerts-surrounded-necessarily.trycloudflare.com/api/v1/invoices/',
 };
 
-// ── Descriptions tab ────────────────────────────────────────────────────────
-// Every generated document has exactly ONE description placeholder in its
-// table (verified directly against all 7 templates) — the 9-way split lives
-// entirely in the Products tab's desc_* columns, which get auto-appended with
-// product_name/model via withModel_() in buildPayload(). Two problems with
-// that: (1) most of those columns are usually left blank and silently fall
-// back to a generic default, and (2) even a filled-in column never prints
-// verbatim — withModel_() always tacks on extra text.
-// This tab is a purely additive override: same 9 columns, keyed by
-// product_name (must match Products!B exactly, case-insensitive). Whatever
-// is typed here prints EXACTLY as typed — no fallback default, no appending.
-// If this tab doesn't exist, or a model/column here is blank, buildPayload()
-// falls through to the original Products-tab + withModel_() behavior
-// unchanged — nothing about existing generation can regress from adding this.
-var DESCRIPTIONS_TAB_NAME_ = 'Descriptions';
+// ── Descriptions (per-model) ────────────────────────────────────────────────
+// Used to live in a separate 'Descriptions' tab that duplicated Products'
+// own desc_* columns as an "override tier" — removed because having the
+// same 9 columns on two tabs with different precedence rules was exactly
+// what caused descriptions to silently show the wrong text (e.g. Commercial
+// Invoice pulling boilerplate SCOMET-style wording instead of the intended
+// per-vehicle block). Products is now the single source for every per-model
+// description; see buildPayload()'s withModel_() note there for how the
+// text still gets the product_name/model appended. engine_cc/make/
+// accessories (feeding the auto-generated CI/CHA CI block) moved onto
+// Products too — see PRODUCTS_EXTRA_HEADERS_ below.
 
 // ── Monthly Stock tabs ──────────────────────────────────────────────────────
 // Stock is split across tabs named Stock_YYYY_MM (one per intake month) instead
 // of a single ever-growing "Stock" sheet. Every monthly tab mirrors the exact
 // row/column layout of the original "Stock" sheet (title row 1, instructions
-// row 2, headers row 3, data row 4+) so none of the existing A4:S2000-style
+// row 2, headers row 3, data row 4+) so none of the existing A4:R2000-style
 // ranges elsewhere in this file need to change — only *which sheet* they run
 // against changes, via getSelectedStockSheet_().
 var STOCK_TAB_REGEX_ = /^Stock_\d{4}_\d{2}$/;
@@ -91,7 +106,7 @@ function sameInvoice_(a, b) {
 
 function rowMatchesInvoice_(row, invoiceNo) {
   if (!row) return false;
-  return sameInvoice_(row[7], invoiceNo) || sameInvoice_(row[18], invoiceNo);
+  return sameInvoice_(row[7], invoiceNo) || sameInvoice_(row[12], invoiceNo);  // col H assigned_to, col M PI Invoice No
 }
 
 function listStockTabNames_(ss) {
@@ -184,39 +199,110 @@ function parseDateFlexible_(v) {
   return isNaN(parsed.getTime()) ? null : parsed;
 }
 
-// Per-vehicle columns T-W, added for the full chassis/certificate-level
+// STOCK COLUMN LAYOUT (1-based), current as of removing the unused
+// remarks/visible_for_assign/model_color/assign_display/Smart Fill columns AND
+// visibility_filter (nothing in script.gs ever read any of them for real
+// logic — they were pure formula/display columns) and adding the 3 reference
+// HSN columns at the end:
+//   A chassis_no       B engine_no        C model            D color
+//   E date_received    F supplier         G status           H assigned_to (FINAL/DRAFT invoice_no)
+//   I Selling price (unit_price_usd)   J purchase_inr
+//   K customer_name (contact)   L company_name
+//   M pi_invoice_no (PROFORMA invoice_no)
+//   N eic_cert_no   O first_registration_date   P district_origin_code   Q state_origin_code
+//   R hsn_code_user_country   S hsn_code_india   T hsn_code_pi
+//   U pi_invoice_date (stamped when a vehicle is assigned under PROFORMA mode)
+// Every function that reads/writes the Stock sheet by column index keys off
+// this layout — if you ever reorder columns again, every one of those spots
+// needs to move together, not just the header row.
+
+// Per-vehicle columns N-Q, added for the full chassis/certificate-level
 // description generation used by Commercial Invoice / CHA CI (see
 // buildVehicleDetailBlock_ / buildChaCiVehicleBlock_ below). All 4 are
 // optional per row: district/state origin fall back to the Products-tab
 // per-model value when blank, and eic_cert_no / first_registration_date
-// simply don't print a line if left blank. Nothing reading only A:S breaks —
-// these are pure additions past the existing S column.
-var STOCK_EXTRA_COL_START_ = 20;  // col T, 1-based
-var STOCK_EXTRA_COL_END_   = 23;  // col W, 1-based
+// simply don't print a line if left blank.
+var STOCK_EXTRA_COL_START_ = 14;  // col N, 1-based
+var STOCK_EXTRA_COL_END_   = 17;  // col Q, 1-based
 var STOCK_EXTRA_HEADERS_ = [
   'eic_cert_no', 'first_registration_date', 'district_origin_code', 'state_origin_code'
 ];
 
-// Ensures columns T-W have their header labels in row 3 — safe to call
-// repeatedly, only ever touches header cells that are currently blank.
+// Per-vehicle HSN override columns R-T. hsn_code_user_country feeds
+// Commercial_Invoice/Tax_Invoice/Packing_List, hsn_code_india feeds every
+// other document (SCOMET, Annexure, CHA CI/TI/PL), hsn_code_pi feeds PI
+// FORMAT — see the HSN resolution block in buildPayload() below. All 3 fall
+// back to the existing model-level HSN (Products tab / CONTROL default)
+// when left blank, so filling in nothing changes today's output at all.
+var STOCK_HSN_COL_START_ = 18;  // col R, 1-based
+var STOCK_HSN_COL_END_   = 20;  // col T, 1-based
+var STOCK_HSN_HEADERS_ = [
+  'hsn_code_user_country', 'hsn_code_india', 'hsn_code_pi'
+];
+
+// Per-vehicle PI (Proforma) invoice date, col U. PI Invoice No already lives
+// in col M (written whenever a vehicle is assigned under PROFORMA mode) and
+// survives the later switch to FINAL/DRAFT — but nothing previously recorded
+// WHEN that Proforma was raised, which the Commercial Invoice trailer's
+// "CERTIFYING THAT SHIPMENT IS IN CONFORMITY WITH PROFORMA INVOICE NO. ...
+// DT ..." line needs (it must cite the original PI number+date, not
+// whichever invoice is being generated right now). Stamped alongside PI
+// Invoice No at assignment time — see assignVehiclesFromSidebar_/
+// bulkAssignByModel/quickAddProducts's PROFORMA-mode writes.
+var STOCK_PI_DATE_COL_ = 21;  // col U, 1-based
+var STOCK_PI_DATE_HEADERS_ = ['pi_invoice_date'];
+
+// Ensures columns N-Q, R-T and U have their header labels in row 3 — safe
+// to call repeatedly, only ever touches header cells that are currently blank.
 function ensureStockExtraColumns_(sheet) {
-  var existing = sheet.getRange(3, STOCK_EXTRA_COL_START_, 1, STOCK_EXTRA_HEADERS_.length).getValues()[0];
-  var needsHeaders = existing.some(function(v) { return !String(v || '').trim(); });
-  if (!needsHeaders) return;
-  var range = sheet.getRange(3, STOCK_EXTRA_COL_START_, 1, STOCK_EXTRA_HEADERS_.length);
-  range.setValues([STOCK_EXTRA_HEADERS_]);
-  range.setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+  function fillIfNeeded(startCol, headers) {
+    var existing = sheet.getRange(3, startCol, 1, headers.length).getValues()[0];
+    var needsHeaders = existing.some(function(v) { return !String(v || '').trim(); });
+    if (!needsHeaders) return;
+    var range = sheet.getRange(3, startCol, 1, headers.length);
+    range.setValues([headers]);
+    range.setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+  }
+  fillIfNeeded(STOCK_EXTRA_COL_START_, STOCK_EXTRA_HEADERS_);
+  fillIfNeeded(STOCK_HSN_COL_START_, STOCK_HSN_HEADERS_);
+  fillIfNeeded(STOCK_PI_DATE_COL_, STOCK_PI_DATE_HEADERS_);
+}
+
+// Backfills columns O-R and S-U onto every Stock tab that already exists —
+// the legacy 'Stock' sheet plus every Stock_YYYY_MM tab — so a newly added
+// column shows up immediately everywhere instead of only the next time that
+// particular tab happens to be generated against or freshly created. Called
+// from onOpen so it self-heals on every open; safe to call repeatedly since
+// ensureStockExtraColumns_ is itself a no-op once headers are already present.
+function ensureStockExtraColumnsAllTabs_(ss) {
+  var legacy = ss.getSheetByName('Stock');
+  if (legacy) ensureStockExtraColumns_(legacy);
+  listStockTabNames_(ss).forEach(function(name) {
+    ensureStockExtraColumns_(ss.getSheetByName(name));
+  });
 }
 
 // Creates (or returns) Stock_<yyyy>_<mm>, copying the header layout (rows 1-3)
-// from the legacy 'Stock' sheet or, failing that, the most recent monthly tab —
-// so every monthly tab keeps the same structure the rest of the script assumes.
+// from a dedicated 'StockDemo' tab if one exists, else the legacy 'Stock'
+// sheet, else the most recent monthly tab — so every monthly tab keeps the
+// same structure the rest of the script assumes.
+//
+// StockDemo is preferred deliberately: copying from the previous month's
+// real Stock tab (or the growing legacy Stock sheet) means every copyTo()
+// below runs against however much formatting/data-validation/conditional-
+// formatting has accumulated on hundreds of real vehicle rows — the more a
+// business uses the sheet, the slower every NEW tab becomes to create.
+// StockDemo is meant to be a one-time, kept-empty tab (same header/column
+// structure and formulas, zero real vehicle rows) that you maintain by hand
+// — every future monthly tab copies from that fixed-size template instead,
+// so creation speed never degrades no matter how much real data piles up.
 function ensureMonthlyStockTab_(ss, yyyy, mm) {
   var tabName = 'Stock_' + yyyy + '_' + mm;
   var existing = ss.getSheetByName(tabName);
   if (existing) return existing;
 
-  var template = ss.getSheetByName('Stock');
+  var template = ss.getSheetByName('StockDemo');
+  if (!template) template = ss.getSheetByName('Stock');
   if (!template) {
     var names = listStockTabNames_(ss);
     if (names.length > 0) template = ss.getSheetByName(names[names.length - 1]);
@@ -224,7 +310,7 @@ function ensureMonthlyStockTab_(ss, yyyy, mm) {
 
   var sheet = ss.insertSheet(tabName);
   if (template) {
-    var lastCol = Math.max(template.getLastColumn(), STOCK_EXTRA_COL_END_);  // keep at least A:W
+    var lastCol = Math.max(template.getLastColumn(), STOCK_PI_DATE_COL_);  // keep at least A:U
     var headerRange = template.getRange(1, 1, 3, lastCol);
     var headerRows = headerRange.getValues();
     headerRows[0][0] = 'VEHICLE STOCK REGISTER — ' + Utilities.formatDate(new Date(Number(yyyy), Number(mm) - 1, 1), 'GMT+5:30', 'MMMM yyyy');
@@ -243,7 +329,7 @@ function ensureMonthlyStockTab_(ss, yyyy, mm) {
     // the original Stock sheet had set up on its data rows. PASTE_FORMULA
     // only touches cells that actually contain a formula, so this never
     // duplicates the template's literal vehicle data into the new tab.
-    var dataRowCount = 1997;  // matches the A4:S2000 range used everywhere else
+    var dataRowCount = 1997;  // matches the A4:R2000 range used everywhere else
     var srcData  = template.getRange(4, 1, dataRowCount, lastCol);
     var destData = sheet.getRange(4, 1, dataRowCount, lastCol);
     srcData.copyTo(destData, SpreadsheetApp.CopyPasteType.PASTE_FORMULA, false);
@@ -258,17 +344,17 @@ function ensureMonthlyStockTab_(ss, yyyy, mm) {
     }
   } else {
     sheet.getRange(1, 1).setValue('VEHICLE STOCK REGISTER — ' + yyyy + '-' + mm);
-    sheet.getRange(3, 1, 1, 16).setValues([['chassis_no','engine_no','model','color','date_received','supplier','status','assigned_to','visibility_filter','Selling price','purchase_inr','remarks','visible_for_assign','model_color','assign_display','Smart Fill']]);
-    sheet.getRange(3, 1, 1, 16).setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+    sheet.getRange(3, 1, 1, 10).setValues([['chassis_no','engine_no','model','color','date_received','supplier','status','assigned_to','Selling price','purchase_inr']]);
+    sheet.getRange(3, 1, 1, 10).setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
   }
-  // Ensure the 4 per-vehicle columns T-W exist even if the template predates
+  // Ensure the O-R and S-U per-vehicle/reference columns exist even if the template predates
   // them (e.g. old 'Stock' sheet or an older monthly tab) — see
-  // STOCK_EXTRA_HEADERS_ note above. Safe to call on every creation; only
+  // STOCK_EXTRA_HEADERS_ / STOCK_HSN_HEADERS_ note above. Safe to call on every creation; only
   // touches header row 3, never data rows.
   ensureStockExtraColumns_(sheet);
   sheet.setFrozenRows(3);
 
-  // Apply the customer picker dropdown (col Q) directly too, in case the
+  // Apply the customer picker dropdown (col L) directly too, in case the
   // template sheet never had it set up yet (copyTo above only carries over
   // validations that already existed on the template).
   var built = buildCustomerDropdownRule_(ss.getSheetByName('Customers'));
@@ -277,176 +363,59 @@ function ensureMonthlyStockTab_(ss, yyyy, mm) {
   return sheet;
 }
 
-// Column layout for the 'Descriptions' tab — same header labels as the
-// matching Products tab columns (D, E, O, P, Q, R, S, T, U, V) so anyone
-// already familiar with Products immediately recognizes them here.
-// Columns 12-14 (engine_cc, make, accessories) feed the per-vehicle CI /
-// CHA CI block generator (buildVehicleDetailBlock_ / buildChaCiVehicleBlock_)
-// — they are NOT picked verbatim like the desc_* columns above; the
-// generator composes them into the exact multi-line block your customs
-// paperwork needs, since that block includes per-vehicle chassis/certificate
-// data no single static cell could hold.
-var DESCRIPTIONS_HEADERS_ = [
-  'product_id', 'product_name',
-  'desc_commercial_invoice', 'desc_scomet', 'desc_packing_list', 'desc_tax_invoice',
-  'desc_PI', 'desc_annexure1', 'PI HSN Code',
-  'CHA TI Description', 'CHA PL Description', 'CHA CI Description',
-  'engine_cc', 'make', 'accessories'
-];
+// engine_cc/make/accessories feed the auto-generated Commercial Invoice /
+// CHA CI block (buildVehicleDetailBlock_ / buildCommercialInvoiceTrailer_) —
+// they compose into the exact multi-line customs block, since that needs
+// per-vehicle chassis/certificate data no single static cell could hold.
+// These used to live only on the (now-removed) Descriptions tab; appended
+// after Products' own existing columns rather than at a fixed position,
+// since Products' width varies per sheet and is user-maintained, not
+// created by this script the way Stock is.
+var PRODUCTS_EXTRA_HEADERS_ = ['engine_cc', 'make', 'accessories'];
 
-// Creates (or returns) the 'Descriptions' tab if it doesn't already exist.
-// Safe to call repeatedly — never touches Products or any other sheet.
-function ensureDescriptionsTab_(ss) {
-  var sheet = ss.getSheetByName(DESCRIPTIONS_TAB_NAME_);
-  if (sheet) return sheet;
-
-  sheet = ss.insertSheet(DESCRIPTIONS_TAB_NAME_);
-  var lastCol = DESCRIPTIONS_HEADERS_.length;
-
-  sheet.getRange(1, 1).setValue(
-    'ITEM DESCRIPTIONS — exact text per document type, used as-is (no auto-appending)');
-  sheet.getRange(2, 1).setValue(
-    'Fill only what you want to override. product_name must match Products!B exactly (case-insensitive). ' +
-    'Leave a cell blank to keep using the Products tab default for that document.');
-  sheet.getRange(3, 1, 1, lastCol).setValues([DESCRIPTIONS_HEADERS_]);
-  sheet.getRange(3, 1, 1, lastCol).setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
-  sheet.setFrozenRows(3);
-  sheet.autoResizeColumns(1, lastCol);
-
-  // Mirror the product_name dropdown from Products (col B), if available, so
-  // product_name here can only ever be picked from real Products entries —
-  // this is what keeps the modelKey match in buildPayload() reliable.
-  var productSheet = ss.getSheetByName('Products');
-  if (productSheet) {
-    var names = productSheet.getRange('B4:B2000').getValues()
-      .map(function(r) { return String(r[0] || '').trim(); })
-      .filter(Boolean);
-    if (names.length > 0) {
-      sheet.getRange(4, 2, 1997, 1).setDataValidation(
-        SpreadsheetApp.newDataValidation()
-          .requireValueInList(names, true)
-          .setAllowInvalid(true)
-          .setHelpText('Pick a product_name from the Products tab — must match exactly for the override to apply.')
-          .build()
-      );
-    }
-  }
-
-  return sheet;
+// Backfills engine_cc/make/accessories onto the Products tab if it predates
+// them — matches the ensureStockExtraColumns_ pattern: only ever appends
+// headers that are missing (checked by name, not position, so it's safe
+// to run against a Products tab with any existing width) and never touches
+// existing columns or data. Called from onOpen so it self-heals on every
+// open; safe to call repeatedly.
+function ensureProductsExtraColumns_(ss) {
+  var sheet = ss.getSheetByName('Products');
+  if (!sheet) return;
+  var lastCol = Math.max(sheet.getLastColumn(), 1);
+  var existingHeaders = sheet.getRange(3, 1, 1, lastCol).getValues()[0]
+    .map(function(h) { return String(h || '').trim().toLowerCase(); });
+  var missing = PRODUCTS_EXTRA_HEADERS_.filter(function(h) { return existingHeaders.indexOf(h) === -1; });
+  if (missing.length === 0) return;
+  var range = sheet.getRange(3, lastCol + 1, 1, missing.length);
+  range.setValues([missing]);
+  range.setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
 }
 
-// Menu-triggered: create the tab (if missing) and confirm.
-function setupDescriptionsTab() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var existed = !!ss.getSheetByName(DESCRIPTIONS_TAB_NAME_);
-  var sheet = ensureDescriptionsTab_(ss);
-  logAudit('SYSTEM', 'DESCRIPTIONS_TAB_SETUP', existed ? 'Already existed' : 'Created');
-  SpreadsheetApp.getUi().alert(
-    existed ? '✅ Descriptions Tab Already Exists' : '✅ Descriptions Tab Created',
-    'Sheet "' + sheet.getName() + '" is ready.\n\n' +
-    'Fill in product_name (col B, dropdown matches Products) plus whichever document description columns ' +
-    'you want to override with exact text. Leave the rest blank — those documents keep using the Products tab as before.\n\n' +
-    'Nothing here affects existing generation until you actually fill in a row.',
-    SpreadsheetApp.getUi().ButtonSet.OK
-  );
-}
-
-// Menu-triggered: seed two sample rows (matching PROD001/PROD002 in the
-// reference Products sheet) with distinct, realistic text per document type,
-// purely so the override path can be tested end-to-end before real data goes
-// in. Never touches Products — only adds/overwrites rows in Descriptions.
-function seedDescriptionsDummyData() {
-  var ui = SpreadsheetApp.getUi();
-  var confirm = ui.alert('🧪 Seed Test Description Data',
-    'This adds 2 sample rows to the Descriptions tab (for BAJAJ PULSAR NS 250 and BAJAJ AVENGER 160) ' +
-    'with distinct made-up text per document, purely for testing that each document shows its own wording.\n\n' +
-    'Safe to run — only affects the Descriptions tab. Continue?',
-    ui.ButtonSet.YES_NO);
-  if (confirm !== ui.Button.YES) return;
-
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ensureDescriptionsTab_(ss);
-
-  var dummyRows = [
-    [
-      'PROD001', 'BAJAJ PULSAR NS 250',
-      '[TEST] Commercial Invoice text — BAJAJ PULSAR NS 250 motorcycle',
-      '[TEST] SCOMET text — Motorcycle, cylinder capacity >250cc <=500cc',
-      '[TEST] Packing List text — 1 motorcycle per wooden crate, PULSAR NS 250',
-      '[TEST] Tax Invoice text — Motor Cycle (PULSAR NS 250) as per HSN 87112019',
-      '[TEST] PI FORMAT text — Motorcycle PULSAR NS 250 for export',
-      '[TEST] Annexure-1 text — PULSAR NS 250 unit declaration',
-      '87112019',
-      '[TEST] CHA Tax Invoice text — PULSAR NS 250',
-      '[TEST] CHA Packing List text — PULSAR NS 250',
-      '[TEST] CHA Commercial Invoice text — PULSAR NS 250'
-    ],
-    [
-      'PROD002', 'BAJAJ AVENGER 160',
-      '[TEST] Commercial Invoice text — BAJAJ AVENGER 160 motorcycle',
-      '[TEST] SCOMET text — Motorcycle, cylinder capacity >75cc <=250cc',
-      '[TEST] Packing List text — 1 motorcycle per wooden crate, AVENGER 160',
-      '[TEST] Tax Invoice text — Motor Cycle (AVENGER 160) as per HSN 87112019',
-      '[TEST] PI FORMAT text — Motorcycle AVENGER 160 for export',
-      '[TEST] Annexure-1 text — AVENGER 160 unit declaration',
-      '87112019',
-      '[TEST] CHA Tax Invoice text — AVENGER 160',
-      '[TEST] CHA Packing List text — AVENGER 160',
-      '[TEST] CHA Commercial Invoice text — AVENGER 160'
-    ]
-  ];
-
-  var existing = sheet.getRange(4, 1, 1997, 2).getValues();
-  dummyRows.forEach(function(newRow) {
-    // Reuse the row if this model_name already has one (re-running the seed
-    // just refreshes the test text), otherwise take the first blank row.
-    var targetRow = -1;
-    for (var i = 0; i < existing.length; i++) {
-      if (String(existing[i][1]).trim().toUpperCase() === newRow[1].toUpperCase()) { targetRow = i + 4; break; }
-    }
-    if (targetRow === -1) {
-      for (var j = 0; j < existing.length; j++) {
-        if (!existing[j][0] && !existing[j][1]) { targetRow = j + 4; break; }
-      }
-    }
-    if (targetRow === -1) targetRow = sheet.getLastRow() + 1;
-    sheet.getRange(targetRow, 1, 1, newRow.length).setValues([newRow]);
-  });
-
-  logAudit('SYSTEM', 'DESCRIPTIONS_DUMMY_SEEDED', '2 test rows added/updated');
-  ui.alert('✅ Test Data Added',
-    '2 sample rows added to the Descriptions tab.\n\n' +
-    'To test: assign a PULSAR NS 250 or AVENGER 160 vehicle to an invoice and generate documents — ' +
-    'each document should now show its own "[TEST] ..." wording instead of the Products-tab default.\n\n' +
-    'Delete these rows (or clear the cells) once you\'ve confirmed it works and are ready to enter real text.',
-    ui.ButtonSet.OK);
+// Manual-run helper — onOpen() calls SpreadsheetApp.getUi() to build the menu,
+// which throws "Cannot call SpreadsheetApp.getUi() from this context" if run
+// directly from the Apps Script editor's ▶ Run button (only a real open of
+// the spreadsheet gives onOpen that UI context). This skips the menu/getUi()
+// part entirely, so it can be run manually to add engine_cc/make/accessories/
+// invoice_code to the Products tab without needing to reopen the sheet.
+function addProductColumnsNow() {
+  ensureProductsExtraColumns_(SpreadsheetApp.getActiveSpreadsheet());
 }
 
 // ── Invoice_Descriptions tab ────────────────────────────────────────────────
-// Simplest possible override, one row per shipment (not per model): type the
-// complete, exact final text for each document directly, once. No per-vehicle
-// chassis blocks, no auto-appending, no Stock/CONTROL schema to fill in —
-// just literal text in, literal text out.
-// Checked FIRST in buildPayload(), before the per-model Descriptions tab and
-// before the auto-generated CI/CHA CI/CHA TI/CHA PL blocks — if a row exists
-// here for the current invoice, it wins outright and everything else (the
-// per-vehicle generation, the model-keyed Descriptions tab) is skipped for
-// that document. Leave a cell blank to fall through to those instead.
+// Read-only preview tab now — one row per shipment, showing exactly what
+// text ended up printed on each document (Products tab default or the
+// auto-generated per-vehicle VIN/CI block). The old manual per-invoice
+// override columns (desc_commercial_invoice, desc_scomet, ... CHA CI
+// Description) were removed since they went unused; text is always sourced
+// from the Products tab / auto-generated blocks now — see buildPayload().
 //
 // invoice_no vs pi_invoice_no: a shipment's PROFORMA number and its eventual
 // FINAL invoice number are often different values typed into the same
 // CONTROL!C8 cell at different stages. One row here can serve both stages —
-// fill in whichever number(s) apply. When CONTROL's Mode is PROFORMA, the
-// lookup matches against pi_invoice_no; for FINAL/DRAFT it matches
-// invoice_no. Fill in just one if you only need one stage, or both if the
-// same row should answer to either number as the shipment progresses.
+// see writeDescriptionPreview_ for how both get consolidated onto one row.
 var INVOICE_DESC_TAB_NAME_ = 'Invoice_Descriptions';
-var INVOICE_DESC_HEADERS_ = [
-  'invoice_no', 'pi_invoice_no',
-  'desc_commercial_invoice', 'desc_scomet', 'desc_packing_list', 'desc_tax_invoice',
-  'desc_PI', 'desc_annexure1',
-  'CHA TI Description', 'CHA PL Description', 'CHA CI Description'
-];
+var INVOICE_DESC_HEADERS_ = ['invoice_no', 'pi_invoice_no'];
 
 function ensureInvoiceDescriptionsTab_(ss) {
   var sheet = ss.getSheetByName(INVOICE_DESC_TAB_NAME_);
@@ -456,12 +425,11 @@ function ensureInvoiceDescriptionsTab_(ss) {
   var lastCol = INVOICE_DESC_HEADERS_.length;
 
   sheet.getRange(1, 1).setValue(
-    'INVOICE DESCRIPTIONS — one row per shipment, exact text per document, used as-is');
+    'INVOICE DESCRIPTIONS — read-only preview of the exact text generated for each document, one row per shipment');
   sheet.getRange(2, 1).setValue(
-    'Fill in invoice_no (FINAL/DRAFT number) and/or pi_invoice_no (PROFORMA number) exactly as they appear in ' +
-    'CONTROL!' + CFG.invoiceNoCell + ' at each stage, then type the complete text you want printed on each ' +
-    'document. Leave a description cell blank to fall back to the Descriptions tab (per-model) or Products tab ' +
-    'instead. This tab always wins when filled in.');
+    'invoice_no / pi_invoice_no are stamped automatically the first time documents are generated for that invoice. ' +
+    'Everything from column C onward is auto-generated and overwritten on every generation run — nothing on this ' +
+    'tab feeds back into the documents.');
   sheet.getRange(3, 1, 1, lastCol).setValues([INVOICE_DESC_HEADERS_]);
   sheet.getRange(3, 1, 1, lastCol).setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
   sheet.setFrozenRows(3);
@@ -471,15 +439,13 @@ function ensureInvoiceDescriptionsTab_(ss) {
 }
 
 // ── Auto-generated description preview (read-only) ──────────────────────────
-// Sits to the right of the manual override columns (A:K), starting at col M
-// (col L left blank as a visual spacer) — a completely separate block that
-// buildPayload() never reads back. Every generation run overwrites it with
-// whatever text actually ended up in that invoice's documents (Products
-// default, a Descriptions-tab override, the auto-generated VIN/CI block, or
-// an Invoice_Descriptions override itself), so you can check what printed
-// without opening the .docx. Safe to ignore — nothing here feeds back into
-// generation, unlike columns A:K.
-var DESC_PREVIEW_COL_START_ = 13;  // col M, 1-based
+// Starts at col C — right after invoice_no/pi_invoice_no, no spacer column —
+// a completely separate block that buildPayload() never reads back. Every
+// generation run overwrites it with whatever text actually ended up in that
+// invoice's documents (Products tab default or the auto-generated
+// per-vehicle VIN/CI block), so you can check what printed without opening
+// the .docx.
+var DESC_PREVIEW_COL_START_ = 3;  // col C, 1-based
 var DESC_PREVIEW_HEADERS_ = [
   'Generated: Commercial Invoice', 'Generated: SCOMET', 'Generated: Packing List',
   'Generated: Tax Invoice', 'Generated: PI FORMAT', 'Generated: Annexure-1',
@@ -525,9 +491,7 @@ function joinItemsField_(items, field) {
 // (PROFORMA's pi_invoice_no, then FINAL's invoice_no) — matching on only
 // whichever number is active THIS run would create a second, duplicate row
 // once the shipment moves to its other stage. So this matches (and then
-// backfills) on EITHER number, consolidating both stages into one row —
-// exactly the "one row can serve both stages" design the override columns
-// (A:K) already document above.
+// backfills) on EITHER number, consolidating both stages into one row.
 function writeDescriptionPreview_(ss, invoiceNo, piInvoiceNo, items) {
   if (!items || items.length === 0) return;
   if (!invoiceNo && !piInvoiceNo) return;
@@ -551,9 +515,7 @@ function writeDescriptionPreview_(ss, invoiceNo, piInvoiceNo, items) {
   }
 
   // Backfill whichever number(s) are known onto this row — never overwrites
-  // a value already sitting there (e.g. one you typed manually), and every
-  // override column (C:K) stays untouched, so this has zero effect on
-  // generation (buildPayload() skips blank override text either way).
+  // a value already sitting there.
   if (invoiceNo && !String(sheet.getRange(targetRow, 1).getValue() || '').trim())
     sheet.getRange(targetRow, 1).setValue(invoiceNo);
   if (piInvoiceNo && !String(sheet.getRange(targetRow, 2).getValue() || '').trim())
@@ -571,9 +533,8 @@ function setupInvoiceDescriptionsTab() {
   SpreadsheetApp.getUi().alert(
     existed ? '✅ Invoice Descriptions Tab Already Exists' : '✅ Invoice Descriptions Tab Created',
     'Sheet "' + sheet.getName() + '" is ready.\n\n' +
-    'Add a row per invoice: put the invoice number in column A, then type the exact text for each ' +
-    'document in that row\'s columns. That\'s it — no other setup, no other tab, needed.\n\n' +
-    'This always takes priority over the Descriptions tab and the auto-generated CI/CHA text when filled in.',
+    'This is a read-only preview — generating documents for an invoice automatically fills in a row here ' +
+    'showing the exact text that printed on each document. Nothing needs to be typed in.',
     SpreadsheetApp.getUi().ButtonSet.OK
   );
 }
@@ -630,7 +591,7 @@ function migrateStockToMonthlyTabs() {
     ui.ButtonSet.YES_NO);
   if (confirm !== ui.Button.YES) return;
 
-  var lastCol = Math.max(stock.getLastColumn(), 19);
+  var lastCol = Math.max(stock.getLastColumn(), STOCK_HSN_COL_START_);
   var lastRow = stock.getLastRow();
   if (lastRow < 4) { ui.alert('⚠ No Data', 'Stock sheet has no vehicle rows to migrate.', ui.ButtonSet.OK); return; }
 
@@ -678,6 +639,90 @@ function migrateStockToMonthlyTabs() {
     ui.ButtonSet.OK);
 }
 
+// One-time migration: deletes the 6 unused legacy columns — visibility_filter
+// (I) plus remarks/visible_for_assign/model_color/assign_display/Smart Fill
+// (L-P) — from every Stock sheet (nothing in script.gs ever reads any of
+// these for real logic). Because Selling price/purchase_inr sit right after
+// I, and Customer Name/Company Name/PI Invoice No/eic_cert_no/district/state/
+// the 3 HSN columns already sit immediately after the L-P block, deleting
+// both blocks automatically cascades everything else left into exactly the
+// column positions buildPayload() and friends now expect (see the STOCK
+// COLUMN LAYOUT note above ensureStockExtraColumns_) — no separate column-
+// move step needed. Runs against the legacy 'Stock' sheet (if present) plus
+// every Stock_YYYY_MM tab; each block is deleted independently and only if
+// still present, so this is safe to run more than once — including against
+// a sheet that already had one block removed by an earlier version of this
+// migration but not the other. Backs up each sheet as a hidden duplicate
+// first, since deleteColumns has no undo beyond Sheets' own version history.
+function migrateStockColumnsToNewLayout() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ui = SpreadsheetApp.getUi();
+
+  var targets = [];
+  var legacy = ss.getSheetByName('Stock');
+  if (legacy) targets.push(legacy);
+  listStockTabNames_(ss).forEach(function(name) { targets.push(ss.getSheetByName(name)); });
+
+  if (targets.length === 0) {
+    ui.alert('⚠ No Stock Sheets Found', 'Could not find a "Stock" sheet or any Stock_YYYY_MM tabs.', ui.ButtonSet.OK);
+    return;
+  }
+
+  function hasRemarksBlock(sheet) {
+    return String(sheet.getRange(3, 12).getValue() || '').trim().toLowerCase().indexOf('remarks') === 0;
+  }
+  function hasVisibilityFilterCol(sheet) {
+    // Prefix match, not exact equality — some sheets have extra descriptive
+    // text appended in the header cell itself (e.g. "visibility_filter
+    // (AVAILABLE or current invoice RESERVED)"), which an exact-equality
+    // check would silently treat as "already migrated" and skip deleting.
+    return String(sheet.getRange(3, 9).getValue() || '').trim().toLowerCase().indexOf('visibility_filter') === 0;
+  }
+
+  var needsMigration = targets.filter(function(sheet) {
+    return hasRemarksBlock(sheet) || hasVisibilityFilterCol(sheet);
+  });
+
+  if (needsMigration.length === 0) {
+    ui.alert('✅ Already Up To Date', 'Every Stock sheet already matches the new column layout — nothing to migrate.', ui.ButtonSet.OK);
+    return;
+  }
+
+  var confirm = ui.alert('🔀 Migrate Stock Columns to New Layout',
+    needsMigration.length + ' sheet(s) still have unused columns:\n\n' +
+    needsMigration.map(function(s) { return '• ' + s.getName(); }).join('\n') + '\n\n' +
+    'This deletes 6 unused columns (visibility_filter, remarks, visible_for_assign, model_color, assign_display, ' +
+    'Smart Fill) from each, shifting Selling price / purchase_inr / Customer Name / Company Name / PI Invoice No / ' +
+    'eic_cert_no / district / state / HSN columns left into their new positions. A hidden backup copy of each ' +
+    'sheet is made first, so nothing in those columns (e.g. any manually typed remarks) is actually lost.\n\n' +
+    'Continue?',
+    ui.ButtonSet.YES_NO);
+  if (confirm !== ui.Button.YES) return;
+
+  var stamp = Utilities.formatDate(new Date(), 'GMT+5:30', 'yyyyMMdd_HHmmss');
+  var migrated = [];
+  needsMigration.forEach(function(sheet) {
+    var backupSheet = sheet.copyTo(ss);
+    backupSheet.setName(sheet.getName() + '_PRE_MIGRATION_BACKUP_' + stamp);
+    backupSheet.hideSheet();
+    // Delete the L-P block first — its indices (12-16) are unaffected by
+    // whether column I gets deleted before or after it, but deleting I
+    // first would shift L-P down to K-O, so order matters here.
+    if (hasRemarksBlock(sheet)) sheet.deleteColumns(12, 5);
+    if (hasVisibilityFilterCol(sheet)) sheet.deleteColumns(9, 1);
+    migrated.push(sheet.getName());
+  });
+
+  logAudit('SYSTEM', 'STOCK_COLUMNS_MIGRATED', migrated.join(', '));
+  ui.alert('✅ Migration Complete',
+    'Migrated: ' + migrated.join(', ') + '\n\n' +
+    'A hidden backup of each original sheet was created (look for "_PRE_MIGRATION_BACKUP" tabs) — ' +
+    'delete those once you\'ve confirmed everything looks right.\n\n' +
+    'Any new Stock_YYYY_MM tab created from now on will automatically copy this new layout, ' +
+    'since it copies whichever Stock sheet is used as the template.',
+    ui.ButtonSet.OK);
+}
+
 // wordsOnly=false (default) keeps the full "AMOUNT CHARGEABLE IN ... ONLY"
 // sentence — used when this is called directly as a spreadsheet formula.
 // wordsOnly=true returns just the currency + words + "ONLY" part, for
@@ -704,6 +749,152 @@ function AMOUNTWORDS(n, curr, wordsOnly) {
   let result = (wordsOnly ? '' : 'AMOUNT CHARGEABLE IN ') + currText + ' ' + words(whole) + ' ONLY';
   if (cents > 0) result += ' AND PAISE ' + words(cents) + ' ONLY';
   return result;
+}
+
+// ── Dashboard tab ────────────────────────────────────────────────────────────
+// The Dashboard's summary/model-breakdown cells used to be formulas pointing
+// directly at the single legacy 'Stock' sheet (e.g. ='Stock'!...) — those
+// broke into #REF! the moment 'Stock' got renamed/migrated into monthly
+// Stock_YYYY_MM tabs (see migrateStockToMonthlyTabs). Formulas can't easily
+// aggregate across a set of sheets whose names change every month anyway, so
+// this replaces them with script-computed values, refreshed the same way
+// updateChassisDropdown()/refreshMultiProductItemsTable_() already are —
+// on every onOpen and whenever the new filter cell changes.
+var DASHBOARD_TAB_NAME_             = 'Dashboard';
+var DASHBOARD_FILTER_LABEL_CELL_    = 'J1';
+var DASHBOARD_FILTER_CELL_          = 'K1';   // 'ALL' or one specific Stock_YYYY_MM tab name
+var DASHBOARD_SUMMARY_ROW_          = 3;      // B/D/F/H = Total/Available/Reserved/Shipped values
+var DASHBOARD_MODEL_FIRST_ROW_      = 7;      // first per-model data row — TOTAL now goes right after the last model, not above them
+var DASHBOARD_MODEL_CLEAR_LAST_ROW_ = 60;     // generous clear range so stale rows from a shrunk model list (incl. the old TOTAL position) never linger
+
+// Keeps the Stock Month filter dropdown (J1 label / K1 value) in sync with
+// whatever Stock_YYYY_MM tabs currently exist — same self-healing pattern as
+// refreshStockTabDropdown_. Defaults to 'ALL' the first time it's created,
+// which is what makes "show all vehicles" the default per your request.
+function ensureDashboardFilterDropdown_(ss) {
+  var dash = ss.getSheetByName(DASHBOARD_TAB_NAME_);
+  if (!dash) return;
+  var labelCell = dash.getRange(DASHBOARD_FILTER_LABEL_CELL_);
+  if (!String(labelCell.getValue()).trim()) labelCell.setValue('Stock Month Filter  ●').setFontWeight('bold');
+  var filterCell = dash.getRange(DASHBOARD_FILTER_CELL_);
+  if (!String(filterCell.getValue()).trim()) filterCell.setValue('ALL');
+  filterCell.setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireValueInList(['ALL'].concat(listStockTabNames_(ss)), true)
+      .setAllowInvalid(true)
+      .setHelpText('Pick a specific month to show only that Stock tab, or ALL to combine every monthly tab (default).')
+      .build()
+  );
+}
+
+// Recomputes every value the Dashboard shows — total/available/reserved/
+// shipped counts (row 3), the per-model breakdown table (dynamically one row
+// per model actually found in the selected Stock tab(s), replacing whatever
+// was there before), and the zero-stock alert (C18). 'ALL' (the default)
+// combines every Stock_YYYY_MM tab plus the legacy 'Stock' sheet if it still
+// exists; picking one month's tab in the filter shows only that month.
+function refreshDashboard_(ss) {
+  var dash = ss.getSheetByName(DASHBOARD_TAB_NAME_);
+  if (!dash) return;
+  ensureDashboardFilterDropdown_(ss);
+
+  var filterVal = String(dash.getRange(DASHBOARD_FILTER_CELL_).getValue() || '').trim().toUpperCase();
+  var targetTabNames;
+  if (!filterVal || filterVal === 'ALL') {
+    targetTabNames = listStockTabNames_(ss);
+    if (ss.getSheetByName('Stock')) targetTabNames = ['Stock'].concat(targetTabNames);
+  } else {
+    targetTabNames = [filterVal];
+  }
+
+  var totalVehicles = 0, availableCount = 0, reservedCount = 0, shippedCount = 0;
+  var modelStats = {};  // model name -> { available, reserved, shipped }
+
+  targetTabNames.forEach(function(tabName) {
+    var sheet = ss.getSheetByName(tabName);
+    if (!sheet) return;
+    sheet.getRange('A4:G2000').getValues().forEach(function(r) {
+      if (!r[0]) return;  // blank chassis = no vehicle on this row
+      var model  = String(r[2] || '').trim() || '(no model)';
+      var status = String(r[6] || '').trim().toUpperCase();  // col G = status
+      if (!modelStats[model]) modelStats[model] = { available: 0, reserved: 0, shipped: 0 };
+      totalVehicles++;
+      if (status === 'AVAILABLE')     { availableCount++; modelStats[model].available++; }
+      else if (status === 'RESERVED') { reservedCount++;  modelStats[model].reserved++;  }
+      else if (status === 'SHIPPED')  { shippedCount++;   modelStats[model].shipped++;   }
+    });
+  });
+
+  dash.getRange('B' + DASHBOARD_SUMMARY_ROW_).setValue(totalVehicles);
+  dash.getRange('D' + DASHBOARD_SUMMARY_ROW_).setValue(availableCount);
+  dash.getRange('F' + DASHBOARD_SUMMARY_ROW_).setValue(reservedCount);
+  dash.getRange('H' + DASHBOARD_SUMMARY_ROW_).setValue(shippedCount);
+
+  // Clear the whole per-model block first — content AND formatting. The
+  // model set can shrink, grow, or reorder between refreshes (new model
+  // added, filter switched to a month with fewer models, etc.), so stale
+  // rows AND stale background colors from a previous refresh (including
+  // wherever TOTAL used to land, and the sheet's original manually-colored
+  // template rows that only ever covered a fixed number of rows) must never
+  // linger below or clash with whatever the fresh list writes.
+  var clearRows = DASHBOARD_MODEL_CLEAR_LAST_ROW_ - DASHBOARD_MODEL_FIRST_ROW_ + 1;
+  var clearRange = dash.getRange(DASHBOARD_MODEL_FIRST_ROW_, 1, clearRows, 8);
+  clearRange.clearContent();
+  clearRange.setBackground(null).setFontWeight('normal');
+
+  var modelNames = Object.keys(modelStats).sort();
+  var rows = modelNames.map(function(name) {
+    var s = modelStats[name];
+    return [name, '', s.available, '', s.reserved, '', s.shipped, s.available + s.reserved + s.shipped];
+  });
+  if (rows.length > 0) dash.getRange(DASHBOARD_MODEL_FIRST_ROW_, 1, rows.length, 8).setValues(rows);
+
+  // TOTAL row now sits right after the LAST model row (not above the list) —
+  // its position is dynamic since the model count changes every refresh.
+  var totalRow = DASHBOARD_MODEL_FIRST_ROW_ + modelNames.length;
+  dash.getRange('A' + totalRow).setValue('TOTAL').setFontWeight('bold');
+  dash.getRange('C' + totalRow).setValue(availableCount);
+  dash.getRange('E' + totalRow).setValue(reservedCount);
+  dash.getRange('G' + totalRow).setValue(shippedCount);
+  dash.getRange('H' + totalRow).setValue(totalVehicles).setFontWeight('bold');
+
+  formatDashboardModelTable_(dash, DASHBOARD_MODEL_FIRST_ROW_, totalRow);
+}
+
+// Applies formatting to the STOCK BY MODEL block every refresh, so it's
+// self-healing regardless of how many models exist — fixes two things that
+// were leftover static formatting from the sheet's original template (never
+// actually written by this script): the header row (6) had alternating
+// navy/white cells because only A/C/E/G/H were colored, not the B/D/F
+// spacer columns; and the colored Available/Reserved/Shipped blocks only
+// ever covered whatever fixed row range the template happened to color, so
+// TOTAL (now dynamic) showed no color once it moved past that range.
+function formatDashboardModelTable_(dash, firstRow, totalRow) {
+  dash.getRange(6, 1, 1, 8).setBackground('#1e3a5f').setFontColor('#ffffff').setFontWeight('bold');
+
+  if (totalRow >= firstRow) {
+    var numRows = totalRow - firstRow + 1;
+    dash.getRange(firstRow, 2, numRows, 2).setBackground('#dcfce7');  // B:C Available
+    dash.getRange(firstRow, 4, numRows, 2).setBackground('#fef9c3');  // D:E Reserved
+    dash.getRange(firstRow, 6, numRows, 2).setBackground('#e2e8f0');  // F:G Shipped
+    dash.getRange(firstRow, 8, numRows, 1).setBackground('#ffffff');  // H Total — plain
+  }
+
+  // Top border on the TOTAL row visually separates it from the model list
+  // above, since it no longer has a distinct background of its own.
+  dash.getRange(totalRow, 1, 1, 8).setBorder(true, null, null, null, null, null);
+}
+
+function refreshDashboardManual_() {
+  refreshDashboard_(SpreadsheetApp.getActiveSpreadsheet());
+  SpreadsheetApp.getUi().alert('✅ Dashboard Refreshed', 'Totals, per-model breakdown and the stock alert are up to date.', SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+// Manual-run helper — same getUi() problem as addProductColumnsNow above:
+// select this in the Apps Script editor's function dropdown and click ▶ Run
+// to refresh the Dashboard without needing to reopen the actual spreadsheet.
+function refreshDashboardNow() {
+  refreshDashboard_(SpreadsheetApp.getActiveSpreadsheet());
 }
 
 function onOpen() {
@@ -733,17 +924,20 @@ function onOpen() {
     .addSeparator()
     .addItem('🆕 Create Monthly Stock Tab (Stock_YYYY_MM)',    'createMonthlyStockTab')
     .addItem('🔀 Migrate Stock → Monthly Tabs (one-time, do this first)', 'migrateStockToMonthlyTabs')
+    .addItem('🔀 Migrate Stock Columns to New Layout (remove unused cols)', 'migrateStockColumnsToNewLayout')
     .addSeparator()
     .addItem('🔄 Refresh Chassis Dropdown',    'updateChassisDropdown')
-    .addItem('👤 Set Customer Dropdowns (Stock Q/R)', 'setupCustomerDropdowns')
+    .addItem('👤 Set Customer Dropdowns (Stock K/L)', 'setupCustomerDropdowns')
     .addSeparator()
     .addItem('📋 Setup Invoice Descriptions Tab (simplest — one row per invoice)', 'setupInvoiceDescriptionsTab')
-    .addItem('📝 Setup Descriptions Tab (per-model, advanced)', 'setupDescriptionsTab')
-    .addItem('🧪 Seed Test Description Data (for testing only)', 'seedDescriptionsDummyData')
+    .addItem('📊 Refresh Dashboard',           'refreshDashboardManual_')
     .addToUi();
   updateChassisDropdown();
   refreshStockTabDropdown_(SpreadsheetApp.getActiveSpreadsheet());
   ensureCustomsFieldsLabels_(SpreadsheetApp.getActiveSpreadsheet());
+  ensureStockExtraColumnsAllTabs_(SpreadsheetApp.getActiveSpreadsheet());
+  ensureProductsExtraColumns_(SpreadsheetApp.getActiveSpreadsheet());
+  refreshDashboard_(SpreadsheetApp.getActiveSpreadsheet());
 }
 
 function onEdit(e) {
@@ -756,8 +950,6 @@ function onEdit(e) {
 
   if (isStockTabName_(name) && col === 8 && row >= 4)
     sheet.getRange(row, 7).setValue(e.range.getValue() ? 'RESERVED' : 'AVAILABLE');
-  if (isStockTabName_(name) && col === 9 && row >= 4 && e.range.getValue())
-    sheet.getRange(row, 7).setValue('SHIPPED');
 
   // Refresh C17 chassis dropdown whenever invoice number in C8 changes
   if (name === 'CONTROL' && cell === 'C8')
@@ -767,6 +959,10 @@ function onEdit(e) {
   if (name === 'CONTROL' && cell === CFG.stockTabCell)
     updateChassisDropdown();
 
+  // Refresh Dashboard totals/model table whenever its Stock Month filter changes
+  if (name === DASHBOARD_TAB_NAME_ && cell === DASHBOARD_FILTER_CELL_)
+    refreshDashboard_(ss);
+
   // Customer autofill: selecting from C12 fills address and country in CONTROL
   if (name === 'CONTROL' && cell === 'C12')
     autoFillCustomerDetails_(sheet, ss, e.range.getValue());
@@ -775,13 +971,13 @@ function onEdit(e) {
   if (name === 'CONTROL' && cell === 'C17')
     autoFillChassisDetails_(sheet, ss, e.range.getValue());
 
-  // Auto-split customer dropdown in any Stock tab's col Q → contact_name (Q) + company_name (R)
-  if (isStockTabName_(name) && col === 17 && row >= 4 && e.value) {
+  // Auto-split customer dropdown in any Stock tab's col K → contact_name (K) + company_name (L)
+  if (isStockTabName_(name) && col === 11 && row >= 4 && e.value) {
     var val = String(e.value).trim();
     var sep = val.indexOf(' — ');
     if (sep !== -1) {
-      sheet.getRange(row, 17).setValue(val.substring(0, sep).trim());
-      sheet.getRange(row, 18).setValue(val.substring(sep + 3).trim());
+      sheet.getRange(row, 11).setValue(val.substring(0, sep).trim());
+      sheet.getRange(row, 12).setValue(val.substring(sep + 3).trim());
     }
   }
 }
@@ -808,8 +1004,8 @@ function onSelectionChange(e) {
   try { stock = getSelectedStockSheet_(ss, sheet); } catch (err) { return; }
 
   var mode   = String(sheet.getRange(CFG.modeCell).getValue() || '').trim();
-  var invCol = (mode === 'PROFORMA') ? 18 : 7;
-  var reservedCount = stock.getRange('A4:S2000').getValues()
+  var invCol = (mode === 'PROFORMA') ? 12 : 7;  // col M PI Invoice No, or col H assigned_to
+  var reservedCount = stock.getRange('A4:R2000').getValues()
     .filter(function(r) { return r[0] && String(r[6]).trim() === 'RESERVED' && sameInvoice_(r[invCol], invoiceNo); }).length;
 
   if (reservedCount > 1) showGenerationVehicleSelector();
@@ -872,16 +1068,14 @@ function autoFillChassisDetails_(ctrl, ss, dropdownVal) {
   var stock;
   try { stock = getSelectedStockSheet_(ss, ctrl); } catch (err) { Logger.log('⚠ Chassis autofill: ' + err.message); return; }
 
-  var rows = stock.getRange('A4:J2000').getValues();
+  var rows = stock.getRange('A4:I2000').getValues();
   for (var i = 0; i < rows.length; i++) {
     var r = rows[i];
     if (!r[0]) continue;
     if (String(r[0]).trim() !== chassisNo) continue;
 
-    var unitPrice = Number(r[9]) || 0;    // col J = unit_price_usd
-    var model     = String(r[2] || '').trim();
-    var netWt     = Number(r[5] || 0);    // col F = net weight (if stored)
-    var grossWt   = Number(r[6] || 0);    // col G = status (not weight — skip)
+    var unitPrice = Number(r[8]) || 0;    // col I = Selling price (unit_price_usd)
+    var model     = String(r[2] || '').trim();  // col C = model
 
     if (unitPrice > 0) ctrl.getRange('F26').setValue(unitPrice);
     Logger.log('✅ Chassis autofill: chassis="' + chassisNo + '" | model="' + model + '" | price=' + unitPrice);
@@ -892,19 +1086,21 @@ function autoFillChassisDetails_(ctrl, ss, dropdownVal) {
 
 // Populates C17 with chassis entries where Stock col G = 'RESERVED' AND col H = current invoice
 // Format: "chassis - engine - model - color" to match the existing dropdown display style
-// ── ⑨ MULTI-PRODUCT SHIPMENT ITEMS table (CONTROL!A46:B53) ──────────────────
-// This table already has live formulas in columns C-H (UNIT PRICE via
-// VLOOKUP into Products, FOB SUBTOTAL, CI DESCRIPTION, VINs LINKED via
-// COUNTIFS, STATUS) that key off column A's "PROD_ID — MODEL NAME" smart-
-// dropdown format (Products!N) and column B's quantity — only A and B are
-// meant to be typed/filled in, never the formula columns. This is exactly
-// why a single flat Quantity/Unit Price in section ⑤ falls apart once a
-// shipment has more than one model or price: this table is where the real
-// per-model breakdown belongs, and each row's formulas already resolve its
-// own price/description/status independently. Fills one row per distinct
-// model among the vehicles actually assigned (or, if a "Select Vehicles for
-// Generation" subset is active via C17, just that subset) — never touches
-// columns C-H so their formulas keep working untouched.
+// ── ⑨ MULTI-PRODUCT SHIPMENT ITEMS table (CONTROL!A46:D53) ──────────────────
+// Column C (UNIT PRICE) used to be a hand-typed VLOOKUP into Products —
+// broken on two counts: it pointed at column 13 of a range that only spans
+// Products!A:F (structurally out of bounds, always erroring under the
+// IFERROR wrapper → blank price → FOB Subtotal silently stuck at 0), and
+// even fixed, column 13 used to be Products' own default_price_usd, which
+// was removed from Products entirely earlier this project (Stock's
+// per-vehicle price always takes priority — see the note above
+// PRODUCTS_EXTRA_HEADERS_). A hand-typed formula can't safely track a
+// Products tab whose columns keep changing, and there's no default price
+// left there to look up anyway — same root cause as the Dashboard's old
+// #REF! breakage. So C (unit price, averaged) and D (FOB subtotal, the
+// exact sum of each vehicle's own Stock price) are now computed here
+// directly from Stock and written as values, not formulas. E-H (CI
+// DESCRIPTION, VINs LINKED, STATUS) are untouched hand-typed formulas.
 var MULTI_ITEMS_FIRST_ROW_ = 46;
 var MULTI_ITEMS_LAST_ROW_  = 53;
 
@@ -912,9 +1108,9 @@ var MULTI_ITEMS_LAST_ROW_  = 53;
 // quantity times one price, which only ever worked for a single-model
 // shipment. Once vehicles can span different models/prices, that formula
 // breaks (blank price × qty = 0, silently zeroing CIF Total). Re-pointing it
-// at the item table's own per-row FOB Subtotal column (which already
-// multiplies each row's qty by its own VLOOKUP price) keeps FOB/CIF Total
-// correct for any mix. Quantity (C26) is deliberately NOT touched here — it's
+// at the item table's own per-row FOB Subtotal column (now a script-computed
+// value straight from Stock — see the note above MULTI_ITEMS_FIRST_ROW_)
+// keeps FOB/CIF Total correct for any mix. Quantity (C26) is deliberately NOT touched here — it's
 // the manually-typed TARGET quantity that bulkAssignByModel()/validate()/
 // cloneLastShipment() compare actual assignments against ("remaining = qty -
 // alreadyAssigned"); turning it into a readout of already-assigned vehicles
@@ -929,7 +1125,7 @@ function ensureFinancialsFormulas_(ctrl) {
 function refreshMultiProductItemsTable_(ss, ctrl) {
   ensureFinancialsFormulas_(ctrl);
   var capacity  = MULTI_ITEMS_LAST_ROW_ - MULTI_ITEMS_FIRST_ROW_ + 1;
-  var dataRange = ctrl.getRange(MULTI_ITEMS_FIRST_ROW_, 1, capacity, 2);  // A:B only — never touch C:H formulas
+  var dataRange = ctrl.getRange(MULTI_ITEMS_FIRST_ROW_, 1, capacity, 4);  // A:D — E:H stay untouched hand-typed formulas
 
   var inv = String(ctrl.getRange(CFG.invoiceNoCell).getValue() || '').trim();
   if (!inv) { dataRange.clearContent(); return; }
@@ -938,8 +1134,8 @@ function refreshMultiProductItemsTable_(ss, ctrl) {
   try { stock = getSelectedStockSheet_(ss, ctrl); } catch (err) { dataRange.clearContent(); return; }
 
   var mode   = String(ctrl.getRange(CFG.modeCell).getValue() || '').trim();
-  var invCol = (mode === 'PROFORMA') ? 18 : 7;
-  var reservedRows = stock.getRange('A4:S2000').getValues()
+  var invCol = (mode === 'PROFORMA') ? 12 : 7;  // col M PI Invoice No, or col H assigned_to
+  var reservedRows = stock.getRange('A4:R2000').getValues()
     .filter(function(r) { return r[0] && String(r[6]).trim() === 'RESERVED' && sameInvoice_(r[invCol], inv); });
 
   // Same C17 multi-select filter as buildPayload() — only the checked
@@ -991,13 +1187,20 @@ function refreshMultiProductItemsTable_(ss, ctrl) {
     });
   }
 
+  // priceSumByModel accumulates each vehicle's own Stock col I price (r[8])
+  // — the exact sum feeds FOB Subtotal (col D) directly, and dividing by
+  // qty gives the UNIT PRICE (col C) shown for reference. Summing actual
+  // per-vehicle prices rather than qty × a single price keeps the subtotal
+  // correct even when vehicles of the same model were priced differently.
   var qtyByModel = {};
+  var priceSumByModel = {};
   var order = [];
   reservedRows.forEach(function(r) {
     var model = String(r[2] || '').trim();
     if (!model) return;
-    if (!(model in qtyByModel)) { qtyByModel[model] = 0; order.push(model); }
+    if (!(model in qtyByModel)) { qtyByModel[model] = 0; priceSumByModel[model] = 0; order.push(model); }
     qtyByModel[model]++;
+    priceSumByModel[model] += Number(r[8]) || 0;
   });
 
   if (order.length > capacity) {
@@ -1008,9 +1211,11 @@ function refreshMultiProductItemsTable_(ss, ctrl) {
 
   var rows = order.map(function(model) {
     var pid = idByModel[model.toUpperCase()] || '';
-    return [pid ? (pid + ' — ' + model) : model, qtyByModel[model]];
+    var qty = qtyByModel[model];
+    var priceSum = priceSumByModel[model];
+    return [pid ? (pid + ' — ' + model) : model, qty, qty ? priceSum / qty : 0, priceSum];
   });
-  while (rows.length < capacity) rows.push(['', '']);
+  while (rows.length < capacity) rows.push(['', '', '', '']);
   dataRange.setValues(rows);
 }
 
@@ -1027,7 +1232,7 @@ function updateChassisDropdown() {
 
   var invoiceNo    = String(control.getRange('C8').getValue()).trim();
   var mode_        = String(control.getRange(CFG.modeCell).getValue()).trim();
-  var invCol_      = (mode_ === 'PROFORMA') ? 18 : 7;  // 0-based: col S(18) for PROFORMA, col H(7) for FINAL/DRAFT
+  var invCol_      = (mode_ === 'PROFORMA') ? 12 : 7;  // 0-based: col M(12) PI Invoice No for PROFORMA, col H(7) assigned_to for FINAL/DRAFT
   var dropdownCell = control.getRange('C17');
 
   if (!invoiceNo) {
@@ -1035,7 +1240,7 @@ function updateChassisDropdown() {
     return;
   }
 
-  var reservedRows = stock.getRange('A4:S2000').getValues()
+  var reservedRows = stock.getRange('A4:R2000').getValues()
     .filter(function(r) { return r[0] && String(r[6]).trim() === 'RESERVED' && sameInvoice_(r[invCol_], invoiceNo); });
 
   if (reservedRows.length === 0) {
@@ -1107,7 +1312,7 @@ function validate() {
   if (!container) warnings.push('⚠ Container number is empty → cell: C37 (Optional except for Annexure C)');
 
   if (stock && (mode === 'FINAL' || mode === 'PROFORMA')) {
-    let assigned = stock.getRange('A4:S2000').getValues().filter(function(r) { return rowMatchesInvoice_(r, inv); });
+    let assigned = stock.getRange('A4:R2000').getValues().filter(function(r) { return rowMatchesInvoice_(r, inv); });
 
     // If a C17 "Select Vehicles for Generation" subset is active, qty (C26)
     // already reflects just that subset (see refreshMultiProductItemsTable_'s
@@ -1161,7 +1366,7 @@ function validateAndReport() {
 // These build the multi-line, chassis-level goods description your real CI
 // format needs — no static cell could hold this since it must repeat once
 // per physical vehicle (chassis, export inspection certificate, first
-// registration date), not once per model. Fed by the new Stock columns T-W
+// registration date), not once per model. Fed by the Stock columns N-Q
 // (STOCK_EXTRA_HEADERS_) and the Descriptions tab's engine_cc/make columns.
 
 // Formats an 8-digit HSN as customs-dotted notation (87112019 -> 8711.20.19).
@@ -1173,33 +1378,80 @@ function formatHsCodeDotted_(raw) {
   return digits.slice(0, 4) + '.' + digits.slice(4, 6) + '.' + digits.slice(6, 8);
 }
 
+// Roman numerals for the Commercial Invoice's outline-style labels
+// (I. CHASSIS NO / II. MAKE / III. MODEL / IV. YEAR OF MANUFACTURE / ...).
+// 20 is far more than this block ever needs (a handful of labeled lines per
+// model plus a handful of shipment-level trailer lines).
+var ROMAN_NUMERALS_ = ['', 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X',
+  'XI', 'XII', 'XIII', 'XIV', 'XV', 'XVI', 'XVII', 'XVIII', 'XIX', 'XX'];
+function toRoman_(n) {
+  return ROMAN_NUMERALS_[n] || String(n);
+}
+
+// Stock's first_registration_date column is free text ("May 2026"), but
+// Sheets silently auto-converts anything that parses as a date into a real
+// Date cell — so script.gs sometimes receives a Date object instead of the
+// typed string. String(dateObj) produces the full JS toString() ("Fri May 01
+// 2026 12:30:00 GMT+0530 (India Standard Time)"), which is what was leaking
+// into the generated Commercial Invoice. Format Date values as "MMM YYYY" to
+// match the plain-text convention (e.g. "MAY 2026"); pass anything else
+// (already-typed text) through unchanged.
+function formatMonthYear_(v) {
+  if (!v) return '';
+  if (v instanceof Date) return Utilities.formatDate(v, 'GMT+5:30', 'MMM yyyy').toUpperCase();
+  return String(v).trim();
+}
+
+// Same auto-conversion problem as formatMonthYear_ above, but for
+// pi_invoice_date (col U) — formats as "dd.MM.yyyy" to match every other
+// date shown in the generated documents (invoice_date, LC date, etc.).
+function formatDdMmYyyy_(v) {
+  if (!v) return '';
+  if (v instanceof Date) return Utilities.formatDate(v, 'GMT+5:30', 'dd.MM.yyyy');
+  return String(v).trim();
+}
+
 // Commercial Invoice style block for one model group:
 //   MODEL CC (HS.CODE: x.xx.xx)
-//   CHASSIS NO:
-//   <chassis1>
-//   NO OF THE EXPORT INSPECTION CERTIFICATE: <cert1>
-//   YEAR/MONTH OF THE FIRST REGISTRATION: <reg1>
-//   <chassis2>                                    <- label NOT repeated
-//   ...
-//   MAKE:   <make>
-//   MODEL:  <model>
-// "CHASSIS NO:" appears once per model group, not once per vehicle — matches
-// the exact format supplied. EIC-certificate / registration lines are
-// omitted per-vehicle if that vehicle's cell is blank, so partially-filled
-// data doesn't print empty labels.
-function buildVehicleDetailBlock_(modelDisplay, engineCc, hsCodeDotted, make, vehicleGroup) {
+//   I.  CHASSIS NO:
+//     1.<chassis1>
+//        NO OF THE EXPORT INSPECTION CERTIFICATE: <cert1>
+//        YEAR/MONTH OF THE FIRST REGISTRATION: <reg1>
+//     2.<chassis2>                              <- label NOT repeated
+//   II.  MAKE:   <make>
+//   III. MODEL:  <model>
+// "I. CHASSIS NO:" appears once per model group, not once per vehicle. The
+// Roman-numeral labels (I/II/III) RESET at the start of every model group —
+// each model is its own self-contained numbered block — but the Arabic
+// chassis numbers (1/2/3...) run globally across the WHOLE invoice, picked
+// up via chassisNumStart/returned as nextChassisNum so the next model
+// continues counting instead of restarting at 1. EIC-certificate /
+// registration lines are omitted per-vehicle if that vehicle's cell is
+// blank, so partially-filled data doesn't print empty labels.
+function buildVehicleDetailBlock_(modelDisplay, engineCc, hsCodeDotted, make, vehicleGroup, chassisNumStart) {
   var lines = [];
   var ccPart = engineCc ? (String(engineCc).trim() + ' ') : '';
   lines.push(modelDisplay + ' ' + ccPart + '(HS.CODE: ' + hsCodeDotted + ')');
-  lines.push('CHASSIS NO: ');
+
+  var romanIdx = 0;
+  var chassisNum = chassisNumStart || 1;
+
+  romanIdx++;
+  lines.push(toRoman_(romanIdx) + '.  CHASSIS NO: ');
   vehicleGroup.forEach(function(v) {
-    lines.push(v.chassis_no || '');
-    if (v.eic_cert_no) lines.push('NO OF THE EXPORT INSPECTION CERTIFICATE: ' + v.eic_cert_no);
-    if (v.first_registration_date) lines.push('YEAR/MONTH OF THE FIRST REGISTRATION: ' + v.first_registration_date);
+    lines.push(chassisNum + '.' + (v.chassis_no || ''));
+    chassisNum++;
+    if (v.eic_cert_no) lines.push('   NO OF THE EXPORT INSPECTION CERTIFICATE: ' + v.eic_cert_no);
+    if (v.first_registration_date) lines.push('   YEAR/MONTH OF THE FIRST REGISTRATION: ' + v.first_registration_date);
   });
-  if (make) lines.push('MAKE:   ' + make);
-  lines.push('MODEL:  ' + modelDisplay);
-  return lines.join('\n');
+  if (make) {
+    romanIdx++;
+    lines.push(toRoman_(romanIdx) + '.  MAKE:   ' + make);
+  }
+  romanIdx++;
+  lines.push(toRoman_(romanIdx) + '. MODEL:  ' + modelDisplay);
+
+  return { text: lines.join('\n'), nextChassisNum: chassisNum, nextRomanIdx: romanIdx };
 }
 
 // Packing List style block for one model group:
@@ -1222,9 +1474,20 @@ function buildPackingListVehicleBlock_(baseDesc, vehicleGroup) {
 // Commercial Invoice only: manufacture year/type, accessories, LC/TIN/dealer
 // certificate references, proforma-conformity certification line. Every
 // piece is optional — a blank CONTROL cell just omits that line rather than
-// printing "LC NO.  DT. ".
-function buildCommercialInvoiceTrailer_(ctrl, accessories, invoiceNo, invoiceDate, countryOfOrigin, fallbackYear) {
+// printing "LC NO.  DT. ". Roman-numeral labels continue from
+// startRomanIdx (the last model block's ending index — e.g. if the last
+// model ended at "III. MODEL", this trailer's first labeled line is "IV."),
+// so the whole description reads as one continuous outline instead of
+// restarting the numbering after the vehicle blocks.
+// piInvoiceNo/piInvoiceDate MUST be the ORIGINAL Proforma invoice's number
+// and date (resolved from Stock's pi_invoice_no/pi_invoice_date columns in
+// buildPayload) — this line is certifying the FINAL shipment against that
+// earlier PI, so it can never cite whichever invoice is being generated
+// right now (that was the bug: it used to print the current invoice's own
+// number/date here, which is meaningless when generating the FINAL invoice).
+function buildCommercialInvoiceTrailer_(ctrl, accessories, piInvoiceNo, piInvoiceDate, countryOfOrigin, fallbackYear, startRomanIdx) {
   var lines = [];
+  var romanIdx = startRomanIdx || 0;
   var year = String(ctrl.getRange(CFG.yearOfManufactureCell).getValue() || fallbackYear || '').trim();
   var vehicleType = String(ctrl.getRange(CFG.vehicleTypeCell).getValue() || '').trim();
   var lcNumber = String(ctrl.getRange(CFG.lcCell).getValue() || '').trim();
@@ -1233,21 +1496,23 @@ function buildCommercialInvoiceTrailer_(ctrl, accessories, invoiceNo, invoiceDat
   var dealerCertNo   = String(ctrl.getRange(CFG.dealerCertNoCell).getValue() || '').trim();
   var dealerCertDate = String(ctrl.getRange(CFG.dealerCertDateCell).getValue() || '').trim();
 
-  if (year) lines.push('YEAR OF MANUFACTURE: ' + year);
-  if (vehicleType) lines.push('TYPE OF VEHICLE: ' + vehicleType);
+  if (year) { romanIdx++; lines.push(toRoman_(romanIdx) + '.  YEAR OF MANUFACTURE: ' + year); }
+  if (vehicleType) { romanIdx++; lines.push(toRoman_(romanIdx) + '.  TYPE OF VEHICLE: ' + vehicleType); }
   if (accessories) {
-    lines.push('FOLLOWING ACCESSORIES ARE INSTALLED IN THE VEHICLE:');
+    romanIdx++;
+    lines.push(toRoman_(romanIdx) + '.  FOLLOWING ACCESSORIES ARE INSTALLED IN THE VEHICLE:');
     lines.push(accessories);
   }
-  if (lcNumber) lines.push('LC NO. ' + lcNumber + (lcDate ? (' DT. ' + lcDate) : ''));
-  if (tinNo) lines.push('TIN NO.: ' + tinNo);
+  if (lcNumber) { romanIdx++; lines.push(toRoman_(romanIdx) + '. LC NO. ' + lcNumber + (lcDate ? (' DT. ' + lcDate) : '')); }
+  if (tinNo) { romanIdx++; lines.push(toRoman_(romanIdx) + '. TIN NO.: ' + tinNo); }
   if (dealerCertNo) {
-    lines.push('DEPARTMENT OF MOTOR TRAFFIC OF ' + (countryOfOrigin === 'INDIA' ? String(countryOfOrigin) : String(countryOfOrigin || '')) +
+    romanIdx++;
+    lines.push(toRoman_(romanIdx) + '.  DEPARTMENT OF MOTOR TRAFFIC OF ' + (countryOfOrigin === 'INDIA' ? String(countryOfOrigin) : String(countryOfOrigin || '')) +
       ' DEALER CERTIFICATE NO.' + dealerCertNo + (dealerCertDate ? (' DATED ' + dealerCertDate) : ''));
   }
-  if (invoiceNo) {
+  if (piInvoiceNo) {
     lines.push('CERTIFYING THAT SHIPMENT IS IN CONFORMITY WITH PROFORMA');
-    lines.push('INVOICE NO. ' + invoiceNo + (invoiceDate ? (' DT ' + invoiceDate) : ''));
+    lines.push('INVOICE NO. ' + piInvoiceNo + (piInvoiceDate ? (' DT ' + piInvoiceDate) : ''));
   }
   return lines.join('\n');
 }
@@ -1299,7 +1564,7 @@ function buildLcReferenceLine_(lcNumber, lcDate) {
 function buildPayload(ss, ctrl, inv) {
   const stock   = getSelectedStockSheet_(ss, ctrl);
   const company = ss.getSheetByName('Company');
-  // Backfills T-W headers on THIS invoice's Stock tab if it predates them —
+  // Backfills O-R and S-U headers on THIS invoice's Stock tab if it predates them —
   // scoped to generation (not every UI call) to avoid needless writes.
   ensureStockExtraColumns_(stock);
 
@@ -1312,8 +1577,17 @@ function buildPayload(ss, ctrl, inv) {
   let generationSelectionActive = false;
 
   var payloadMode = ctrl.getRange(CFG.modeCell).getValue() || 'FINAL';
-  let rawMatchedRows = stock.getRange('A4:W2000').getValues()
-    .filter(function(r) { return rowMatchesInvoice_(r, inv); });
+  // Keeps each matched row's actual sheet row number alongside it (idx+4,
+  // since data starts at row 4) — needed below to backfill pi_invoice_date
+  // in place, which a plain .filter() would lose track of.
+  let rawMatchedRows = [];
+  let matchedRowNumbers = [];
+  stock.getRange('A4:U2000').getValues().forEach(function(r, idx) {
+    if (rowMatchesInvoice_(r, inv)) {
+      rawMatchedRows.push(r);
+      matchedRowNumbers.push(idx + 4);
+    }
+  });
   let vehicles = rawMatchedRows.map(function(r) {
       return {
         chassis_no:     r[0] || '',
@@ -1321,15 +1595,43 @@ function buildPayload(ss, ctrl, inv) {
         model:          r[2] || '',
         color:          r[3] || '',
         year:           r[4] || '',
-        unit_price_usd: Number(r[9]) || 0,
+        unit_price_usd: Number(r[8]) || 0,
+        // col M — the ORIGINAL Proforma invoice number/date this vehicle was
+        // first assigned under, preserved even after the shipment moves to
+        // FINAL. Resolved to a single invoice-wide value below and fed into
+        // buildCommercialInvoiceTrailer_'s "CERTIFYING... PROFORMA INVOICE
+        // NO." line — that line must always cite the original PI, never
+        // whichever invoice is being generated right now.
+        pi_invoice_no:  String(r[12] || '').trim(),
+        pi_invoice_date: formatDdMmYyyy_(r[20]),
         // Per-vehicle fields for the CI / CHA CI detailed description block
-        // (cols T-W, see STOCK_EXTRA_HEADERS_) — all optional.
-        eic_cert_no:            String(r[19] || '').trim(),
-        first_registration_date: String(r[20] || '').trim(),
-        district_origin_code:  String(r[21] || '').trim(),
-        state_origin_code:     String(r[22] || '').trim()
+        // (cols N-Q, see STOCK_EXTRA_HEADERS_) — all optional.
+        eic_cert_no:            String(r[13] || '').trim(),
+        first_registration_date: formatMonthYear_(r[14]),
+        district_origin_code:  String(r[15] || '').trim(),
+        state_origin_code:     String(r[16] || '').trim(),
+        // Per-vehicle HSN overrides (cols R-T, see STOCK_HSN_HEADERS_) — all
+        // optional, resolved into each item's hsn_code_* fields below.
+        hsn_code_user_country: String(r[17] || '').trim(),
+        hsn_code_india:        String(r[18] || '').trim(),
+        hsn_code_pi:           String(r[19] || '').trim()
       };
     });
+
+  // Backfill pi_invoice_date for any PROFORMA-matched vehicle that's
+  // missing it — covers vehicles assigned before this column existed (or
+  // through any path that didn't stamp it), so existing data self-heals
+  // the first time you (re)generate against it instead of staying blank
+  // forever. Never overwrites a date that's already recorded.
+  if (String(payloadMode).trim() === 'PROFORMA') {
+    var piDateStampVal = ctrl.getRange(CFG.dateCell).getValue();
+    for (var vi = 0; vi < rawMatchedRows.length; vi++) {
+      if (!rawMatchedRows[vi][20]) {  // col U, 0-based index 20
+        stock.getRange(matchedRowNumbers[vi], STOCK_PI_DATE_COL_).setValue(piDateStampVal);
+        vehicles[vi].pi_invoice_date = formatDdMmYyyy_(piDateStampVal);
+      }
+    }
+  }
 
   Logger.log('🚗 VEHICLES FOUND: ' + vehicles.length);
   if (vehicles.length === 0) {
@@ -1339,8 +1641,8 @@ function buildPayload(ss, ctrl, inv) {
     // instead of guessing again.
     Logger.log('🔍 DEBUG: 0 vehicles — inv="' + inv + '" charCodes=' +
       String(inv).split('').map(function(c) { return c.charCodeAt(0); }).join(','));
-    var debugInvCol0 = (String(payloadMode).trim() === 'PROFORMA') ? 18 : 7;
-    stock.getRange('A4:S2000').getValues().forEach(function(r, i) {
+    var debugInvCol0 = (String(payloadMode).trim() === 'PROFORMA') ? 12 : 7;
+    stock.getRange('A4:R2000').getValues().forEach(function(r, i) {
       var av = r[debugInvCol0];
       if (av) Logger.log('  row' + (i + 4) + ' assigned_to="' + av + '" charCodes=' +
         String(av).split('').map(function(c) { return c.charCodeAt(0); }).join(','));
@@ -1373,32 +1675,33 @@ function buildPayload(ss, ctrl, inv) {
     }
   }
 
-  // Build product lookup from Products tab
-  // Col A=ID, B=product_name (match key), C=HSN Code (8-digit), D=Commercial desc, E=SCOMET desc,
-  // O(14)=Packing List desc, P(15)=Tax Invoice desc, Q(16)=PI Format desc
+  // Build product lookup from Products tab — the single source for every
+  // per-model description now (the old separate 'Descriptions' override tab
+  // was removed; see the comment above PRODUCTS_EXTRA_HEADERS_ for why).
+  // hsn_code / district_code / state_code / default_price_usd columns removed entirely from
+  // Products (redundant with Stock's per-vehicle overrides, which always take priority
+  // anyway). PI HSN Code also removed — PI FORMAT's HSN now falls back to the CONTROL
+  // default HSN. pref_trade_code and invoice_code both moved to CONTROL cells (see
+  // CFG.prefTradeCodeCell / CFG.invoiceCodeCell) since they're per-shipment customs
+  // declarations, not fixed per-model properties — the Products tab's own
+  // pref_trade_code (col D) and invoice_code columns are no longer read at all.
+  // Current 0-based layout (matches the sheet's actual header row):
+  // 0=product_id, 1=product_name (match key), 2=unit, 3=pref_trade_code (unused), 4=cess_amount,
+  // 5=sqc_code, 6=smart_dropdown, 7=desc_packing_list, 8=desc_tax_invoice, 9=desc_PI,
+  // 10=desc_annexure1, 11=CHA TI Description, 12=CHA PL Description, 13=CHA CI Description,
+  // 14=desc_commercial_invoice, 15=desc_scomet, 16=engine_cc, 17=make, 18=accessories
+  // (16-18 auto-appended by ensureProductsExtraColumns_ after whatever the sheet's last
+  // column currently is — safe regardless of how the first 16 get reordered again).
   var productMap = {};
   var productSheet = ss.getSheetByName('Products');
   if (productSheet) {
-    productSheet.getRange('A3:V2000').getValues().forEach(function(row) {  // A3 skips header; V = last desc column
+    productSheet.getRange('A3:S2000').getValues().forEach(function(row) {  // A3 skips header; S = last column incl. engine_cc/make/accessories
       var modelKey = String(row[1]).toUpperCase().trim();  // col B = product_name (match key)
       if (modelKey) productMap[modelKey] = row;
     });
     Logger.log('📦 PRODUCT TAB keys (' + Object.keys(productMap).length + '): ' + Object.keys(productMap).join(', '));
   } else {
     Logger.log('⚠️ PRODUCT TAB not found — using defaults for all descriptions');
-  }
-
-  // Optional 'Descriptions' tab overrides — see DESCRIPTIONS_TAB_NAME_ note
-  // near CFG for why this exists. Purely additive: empty map (i.e. exactly
-  // today's behavior) if the tab doesn't exist yet or has no matching rows.
-  var descriptionMap = {};
-  var descriptionsSheet = ss.getSheetByName(DESCRIPTIONS_TAB_NAME_);
-  if (descriptionsSheet) {
-    descriptionsSheet.getRange('A4:O2000').getValues().forEach(function(row) {
-      var modelKey = String(row[1] || '').toUpperCase().trim();  // col B = product_name (match key)
-      if (modelKey) descriptionMap[modelKey] = row;
-    });
-    Logger.log('📝 DESCRIPTIONS TAB overrides (' + Object.keys(descriptionMap).length + '): ' + Object.keys(descriptionMap).join(', '));
   }
 
   var defaultDesc     = ctrl.getRange(CFG.itemDescriptionCell || 'C51').getValue() || 'Motorcycles';
@@ -1408,34 +1711,48 @@ function buildPayload(ss, ctrl, inv) {
   var defaultHsnPi    = defaultHsn;  // PI HSN fallback = same as standard default HSN
   Logger.log('📋 DEFAULTS: desc="' + defaultDesc + '" | hsn="' + defaultHsn + '" | district="' + defaultDistrict + '" | state="' + defaultState + '"');
 
-  // Group by model+price so each model gets its own HSN/description row
+  // Grouped by model ONLY (not model+price) — vehicles of the same model
+  // always print as one combined chassis/description block (Commercial
+  // Invoice, CHA CI, Packing List, etc. all loop over `items` flatly, one
+  // block per array entry), so splitting a single model into multiple
+  // groups just because two units happened to have different Stock prices
+  // produced duplicate "MODEL... (HS.CODE...)" blocks with restarted
+  // chassis/Roman-numeral numbering, and left the shipment-level trailer
+  // attached to whichever price group happened to be last instead of the
+  // true last model. rate_per_unit is recomputed below (after every
+  // vehicle in the group is known) as amount_usd / quantity — the true
+  // average — so a uniform-price model still shows its exact price and a
+  // mixed-price model shows a sensible per-unit figure; amount_usd itself
+  // is always the exact sum of that group's real per-vehicle prices.
   var itemsObj = {};
   var controlUnitPrice = Number(ctrl.getRange(CFG.unitPriceCell).getValue()) || 0;
   vehicles.forEach(function(v) {
     var modelKey = String(v.model || '').toUpperCase().trim();
 
     var prod        = productMap[modelKey] || null;
-    var descOverride = descriptionMap[modelKey] || null;
-    Logger.log('  🔎 model="' + v.model + '" → key="' + modelKey + '" → productMatch=' + (prod ? 'YES' : 'NO (using defaults)') +
-      ' → descriptionsOverride=' + (descOverride ? 'YES' : 'NO'));
+    Logger.log('  🔎 model="' + v.model + '" → key="' + modelKey + '" → productMatch=' + (prod ? 'YES' : 'NO (using defaults)'));
 
-    var hsnCode       = prod ? (String(prod[2]).trim()  || defaultHsn)      : defaultHsn;   // col C = HSN code
-    var hsnCodePi     = prod ? (String(prod[18]).trim() || defaultHsnPi)    : defaultHsnPi; // col S = PI HSN (destination country)
-    var descChaTi     = prod ? (String(prod[19]).trim() || defaultDesc)     : defaultDesc;   // col T = CHA Tax Invoice desc
-    var descChaPl     = prod ? (String(prod[20]).trim() || defaultDesc)     : defaultDesc;   // col U = CHA Packing List desc
-    var descChaCi     = prod ? (String(prod[21]).trim() || defaultDesc)     : defaultDesc;   // col V = CHA Commercial Invoice desc
-    var productName   = prod ? (String(prod[1]).trim()  || '')               : '';            // col B = product_name
-    var descComm      = prod ? (String(prod[3]).trim()  || defaultDesc)      : defaultDesc;   // col D
-    var descScomet    = prod ? (String(prod[4]).trim()  || defaultDesc)      : defaultDesc;   // col E
-    var descPacking   = prod ? (String(prod[14]).trim() || defaultDesc)      : defaultDesc;   // col O
-    var descTax       = prod ? (String(prod[15]).trim() || defaultDesc)      : defaultDesc;   // col P
-    var descPi        = prod ? (String(prod[16]).trim() || defaultDesc)      : defaultDesc;   // col Q
-    var descAnnexure1 = prod ? (String(prod[17]).trim() || descComm)         : descComm;      // col R
-    var productPrice  = prod ? (Number(prod[12]) || 0)                       : 0;             // col M = default_price_usd
-    var districtCode  = prod ? (String(prod[6]).trim()  || defaultDistrict)  : defaultDistrict;  // col G
-    var stateCode     = prod ? (String(prod[7]).trim()  || defaultState)     : defaultState;     // col H
+    // hsn_code / district_code / state_code / default_price_usd / invoice_code / PI HSN Code
+    // no longer exist on Products — Stock's per-vehicle overrides and the CONTROL default
+    // cells are the only source for the first 4; invoice_code/PI HSN Code just have no
+    // per-model source anymore (see the layout note above productMap).
+    var hsnCode       = defaultHsn;
+    var hsnCodePi     = defaultHsnPi;
+    var descChaTi     = prod ? (String(prod[11]).trim() || defaultDesc)     : defaultDesc;   // CHA TI Description
+    var descChaPl     = prod ? (String(prod[12]).trim() || defaultDesc)     : defaultDesc;   // CHA PL Description
+    var descChaCi     = prod ? (String(prod[13]).trim() || defaultDesc)     : defaultDesc;   // CHA CI Description
+    var productName   = prod ? (String(prod[1]).trim()  || '')               : '';            // product_name
+    var descComm      = prod ? (String(prod[14]).trim() || defaultDesc)      : defaultDesc;   // desc_commercial_invoice
+    var descScomet    = prod ? (String(prod[15]).trim() || defaultDesc)      : defaultDesc;   // desc_scomet
+    var descPacking   = prod ? (String(prod[7]).trim()  || defaultDesc)      : defaultDesc;   // desc_packing_list
+    var descTax       = prod ? (String(prod[8]).trim()  || defaultDesc)      : defaultDesc;   // desc_tax_invoice
+    var descPi        = prod ? (String(prod[9]).trim()  || defaultDesc)      : defaultDesc;   // desc_PI
+    var descAnnexure1 = prod ? (String(prod[10]).trim() || descComm)         : descComm;      // desc_annexure1
+    var productPrice  = 0;
+    var districtCode  = defaultDistrict;
+    var stateCode     = defaultState;
     var price    = v.unit_price_usd || productPrice || controlUnitPrice;
-    var groupKey = modelKey + '||' + price.toFixed(2);
+    var groupKey = modelKey;
 
     Logger.log('    hsn="' + hsnCode + '" | product_name(B)="' + productName + '" | productPrice(M)=' + productPrice);
     Logger.log('    desc_pi(Q)="' + descPi + '" | desc_comm(D)="' + descComm + '" | desc_scomet(E)="' + descScomet + '"');
@@ -1451,31 +1768,20 @@ function buildPayload(ss, ctrl, inv) {
       return parts.filter(Boolean).join(' ');
     }
 
-    // Descriptions-tab override, by column index (see DESCRIPTIONS_HEADERS_):
-    // 2=commercial, 3=scomet, 4=packing, 5=tax, 6=PI, 7=annexure1, 8=PI HSN,
-    // 9=CHA TI, 10=CHA PL, 11=CHA CI. Used VERBATIM — no withModel() append —
-    // since the whole point is exact text with no auto-modification. Falls
-    // through to `fallback` (today's withModel()-wrapped value) if this
-    // column is blank or the tab/row doesn't exist.
-    function pick(colIdx, fallback) {
-      var override = descOverride ? String(descOverride[colIdx] || '').trim() : '';
-      return override || fallback;
-    }
-
     if (!itemsObj[groupKey]) {
       itemsObj[groupKey] = {
         hsn_code:               hsnCode,
-        hsn_code_pi:            pick(8, hsnCodePi),
-        description:            pick(6, withModel(descPi)),  // default = PI FORMAT desc; backend overrides per-template
-        description_commercial: pick(2, withModel(descComm)),
-        description_scomet:     pick(3, withModel(descScomet)),
-        description_packing:    pick(4, withModel(descPacking)),
-        description_tax:        pick(5, withModel(descTax)),
-        description_pi:         pick(6, withModel(descPi)),
-        description_annexure1:  pick(7, withModel(descAnnexure1)),
-        description_cha_ti:     pick(9, withModel(descChaTi)),
-        description_cha_pl:     pick(10, withModel(descChaPl)),
-        description_cha_ci:     pick(11, withModel(descChaCi)),
+        hsn_code_pi:            hsnCodePi,
+        description:            withModel(descPi),  // default = PI FORMAT desc; backend overrides per-template
+        description_commercial: withModel(descComm),
+        description_scomet:     withModel(descScomet),
+        description_packing:    withModel(descPacking),
+        description_tax:        withModel(descTax),
+        description_pi:         withModel(descPi),
+        description_annexure1:  withModel(descAnnexure1),
+        description_cha_ti:     withModel(descChaTi),
+        description_cha_pl:     withModel(descChaPl),
+        description_cha_ci:     withModel(descChaCi),
         quantity:               0,
         rate_per_unit:          price,
         amount_usd:             0,
@@ -1493,9 +1799,35 @@ function buildPayload(ss, ctrl, inv) {
   });
   var items = [];
   Object.keys(itemsObj).forEach(function(k) { items.push(itemsObj[k]); });
+
+  // rate_per_unit was seeded from whichever vehicle happened to create the
+  // group — now that every vehicle of the model is counted, recompute it
+  // as the true average (amount_usd is already the exact sum, unaffected).
+  items.forEach(function(it) {
+    if (it.quantity > 0) it.rate_per_unit = it.amount_usd / it.quantity;
+  });
+
+  // ── Per-vehicle HSN overrides (Stock cols R-T) — resolved into item-level
+  // hsn_code_user_country / hsn_code_india / hsn_code_pi fields, since HSN
+  // prints once per model group, not once per vehicle. Takes the first
+  // vehicle in the group with a non-blank override; falls back to the
+  // existing model-level HSN so leaving these Stock columns blank leaves
+  // every document printing exactly what it did before this feature existed.
+  // document_generator.py picks whichever of these 3 fields matches the
+  // template being rendered (see TEMPLATE_HSN_FIELD there).
+  items.forEach(function(it) {
+    var overrideUserCountry = it.vehicle_list.map(function(v) { return v.hsn_code_user_country; }).filter(Boolean)[0] || '';
+    var overrideIndia       = it.vehicle_list.map(function(v) { return v.hsn_code_india; }).filter(Boolean)[0] || '';
+    var overridePi          = it.vehicle_list.map(function(v) { return v.hsn_code_pi; }).filter(Boolean)[0] || '';
+    it.hsn_code_india        = overrideIndia || it.hsn_code;
+    it.hsn_code_user_country = overrideUserCountry || it.hsn_code;
+    it.hsn_code_pi           = overridePi || it.hsn_code_pi;
+  });
+
   Logger.log('📊 ITEMS BUILT: ' + items.length + ' group(s)');
   items.forEach(function(it, i) {
     Logger.log('  [' + i + '] hsn=' + it.hsn_code + ' | qty=' + it.quantity + ' | rate=' + it.rate_per_unit + ' | amount=' + it.amount_usd);
+    Logger.log('       hsn_india="' + it.hsn_code_india + '" | hsn_user_country="' + it.hsn_code_user_country + '" | hsn_pi="' + it.hsn_code_pi + '"');
     Logger.log('       desc_pi="' + it.description_pi + '"');
     Logger.log('       desc_commercial="' + it.description_commercial + '"');
     Logger.log('       desc_scomet="' + it.description_scomet + '"');
@@ -1530,114 +1862,91 @@ function buildPayload(ss, ctrl, inv) {
   var lcDateVal   = String(ctrl.getRange(CFG.lcDateCell).getValue() || '').trim();
   var lcLine      = buildLcReferenceLine_(lcNumberVal, lcDateVal);
   var countryOfOriginVal = String(ctrl.getRange(CFG.countryOriginCell || 'F23').getValue() || 'INDIA').trim();
+  // Preferential Trade Agreement code (NCPTI / ECTAAU / etc.) and Invoice Code
+  // are both per-shipment customs declarations, not per-model properties —
+  // resolved once here from CONTROL, not from the Products tab. See
+  // CFG.prefTradeCodeCell / CFG.invoiceCodeCell notes above.
+  var prefTradeCodeVal = String(ctrl.getRange(CFG.prefTradeCodeCell).getValue() || '').trim();
+  var invoiceCodeVal   = String(ctrl.getRange(CFG.invoiceCodeCell).getValue() || '').trim();
+
+  // Resolve the ORIGINAL Proforma invoice number/date for the Commercial
+  // Invoice trailer's "CERTIFYING... PROFORMA INVOICE NO." line — every
+  // vehicle on this invoice was assigned together, so the first non-blank
+  // value found is authoritative. Falls back to whichever invoice/date is
+  // being generated right now only if this shipment never actually went
+  // through a PROFORMA stage (no pi_invoice_no ever recorded in Stock) —
+  // better than printing a blank "CERTIFYING..." line.
+  var resolvedPiInvoiceNo   = vehicles.map(function(v) { return v.pi_invoice_no; }).filter(Boolean)[0] || '';
+  var resolvedPiInvoiceDate = vehicles.map(function(v) { return v.pi_invoice_date; }).filter(Boolean)[0] || '';
+
+  // Threaded across every model group below so the Commercial Invoice reads
+  // as one continuous outline: chassis numbers (1, 2, 3...) run globally
+  // across the whole invoice, while the Roman-numeral labels (I/II/III)
+  // reset per model but the trailer picks up where the LAST model's
+  // numbering left off — see buildVehicleDetailBlock_ / buildCommercialInvoiceTrailer_.
+  var globalChassisNum = 1;
+  var lastModelRomanIdx = 0;
 
   items.forEach(function(it, idx) {
     var genProd = productMap[it.model_key] || null;
-    var genOverride = descriptionMap[it.model_key] || null;
-    var engineCc = genOverride ? String(genOverride[12] || '').trim() : '';
-    var make     = genOverride ? String(genOverride[13] || '').trim() : '';
-    var accessories = genOverride ? String(genOverride[14] || '').trim() : '';
+    var engineCc     = genProd ? String(genProd[16] || '').trim() : '';  // engine_cc
+    var make         = genProd ? String(genProd[17] || '').trim() : '';  // make
+    var accessories  = genProd ? String(genProd[18] || '').trim() : '';  // accessories
     var hsCodeDotted = formatHsCodeDotted_(it.hsn_code_pi || it.hsn_code);
 
-    var ciManual = genOverride ? String(genOverride[2] || '').trim() : '';
-    if (!ciManual) {
-      it.description_commercial = buildVehicleDetailBlock_(it.model_display, engineCc, hsCodeDotted, make, it.vehicle_list);
-    }
+    // Commercial Invoice description is ALWAYS the auto-generated per-vehicle
+    // block (chassis/engine-cert/registration date/make/model) — a static
+    // Descriptions-tab column can never correctly represent per-chassis facts
+    // for a model with multiple VINs, so the Descriptions tab's
+    // desc_commercial_invoice column no longer has any effect here (it still
+    // feeds the OTHER document types — SCOMET, Tax Invoice, PI, Annexure —
+    // where a single per-model line is exactly what's needed).
+    var vehicleBlock = buildVehicleDetailBlock_(it.model_display, engineCc, hsCodeDotted, make, it.vehicle_list, globalChassisNum);
+    it.description_commercial = vehicleBlock.text;
+    globalChassisNum = vehicleBlock.nextChassisNum;
+    lastModelRomanIdx = vehicleBlock.nextRomanIdx;
 
-    // Unlike Commercial Invoice/CHA CI (where a Descriptions-tab manual
-    // override replaces the whole generated block outright), Packing List
-    // always gets the VIN breakdown appended — the base line (Products tab
-    // default, or a Descriptions-tab override if one exists) is kept as-is,
-    // but which VINs are listed underneath must always reflect this
-    // invoice's actual assigned/selected vehicles, never a static manual list.
+    // Packing List always gets the VIN breakdown appended — the base line
+    // (Products tab default, or a Descriptions-tab override if one exists)
+    // is kept as-is, but which VINs are listed underneath must always
+    // reflect this invoice's actual assigned/selected vehicles, never a
+    // static manual list.
     it.description_packing = buildPackingListVehicleBlock_(it.description_packing, it.vehicle_list);
 
     // description_cha_ti / description_cha_pl only ever exist to hold ONE
-    // fact: "per LC document no. X dt. Y" for THIS invoice. Unlike Commercial
-    // Invoice/CHA CI (genuinely different, legitimate per-model text, so a
-    // manual override there is real content worth keeping), a Descriptions-
-    // tab entry in these two columns is only ever a placeholder for invoices
-    // that don't have LC info yet — once CONTROL's LC No./Date are filled in,
-    // that live, invoice-specific fact always wins outright, regardless of
-    // whatever static text happens to sit in the Descriptions tab. Both CHA
-    // TI/CHA PL templates render one row PER MODEL GROUP (document_generator.py
-    // copies this field onto every item's own description), so it must be set
-    // on every item, not just the first — leaving it blank on items after the
-    // first (as an earlier version of this did) left every model but the
-    // first with a blank description cell in the actual generated document.
+    // fact: "per LC document no. X dt. Y" for THIS invoice — once CONTROL's
+    // LC No./Date are filled in, that live, invoice-specific fact always
+    // wins outright, regardless of whatever static text happens to sit in
+    // the Descriptions tab. Both CHA TI/CHA PL templates render one row PER
+    // MODEL GROUP (document_generator.py copies this field onto every item's
+    // own description), so it must be set on every item, not just the first —
+    // leaving it blank on items after the first (as an earlier version of
+    // this did) left every model but the first with a blank description
+    // cell in the actual generated document.
     if (lcLine) it.description_cha_ti = lcLine;
     if (lcLine) it.description_cha_pl = lcLine;
 
-    var ciChaManual = genOverride ? String(genOverride[11] || '').trim() : '';
-    if (!ciChaManual && lcLine) {
+    // CHA CI description is ALWAYS the auto-generated per-vehicle block too,
+    // for the same reason as Commercial Invoice above — the Descriptions
+    // tab's "CHA CI Description" column no longer overrides this. Still
+    // requires an LC number/date (nothing to reference otherwise).
+    if (lcLine) {
       it.description_cha_ci = buildChaCiVehicleBlock_(lcLine, it.vehicle_list, it.district_origin_code, it.state_origin_code);
     }
 
     if (idx === items.length - 1) {
-      if (!ciManual) {
-        var fallbackYear = it.vehicle_list.length ? String(it.vehicle_list[0].year || '') : '';
-        var invoiceDateStr = Utilities.formatDate(ctrl.getRange(CFG.dateCell).getValue(), 'GMT+5:30', 'dd.MM.yyyy');
-        var trailer = buildCommercialInvoiceTrailer_(ctrl, accessories, inv, invoiceDateStr, countryOfOriginVal, fallbackYear);
-        if (trailer) it.description_commercial += '\n' + trailer;
-      }
-      if (!ciChaManual && lcLine) {
-        var prefTradeCode = genProd ? String(genProd[8] || '').trim() : '';
-        var invoiceCode   = genProd ? String(genProd[9] || '').trim() : '';
-        var sqcCode       = genProd ? String(genProd[11] || '').trim() : '';
-        var chaCiTrailer = buildChaCiTrailer_(sqcCode, prefTradeCode, invoiceCode, countryOfOriginVal);
+      var fallbackYear = it.vehicle_list.length ? String(it.vehicle_list[0].year || '') : '';
+      var invoiceDateStr = Utilities.formatDate(ctrl.getRange(CFG.dateCell).getValue(), 'GMT+5:30', 'dd.MM.yyyy');
+      var trailer = buildCommercialInvoiceTrailer_(ctrl, accessories, resolvedPiInvoiceNo || inv, resolvedPiInvoiceDate || invoiceDateStr, countryOfOriginVal, fallbackYear, lastModelRomanIdx);
+      if (trailer) it.description_commercial += '\n' + trailer;
+
+      if (lcLine) {
+        var sqcCode       = genProd ? String(genProd[5] || '').trim() : '';
+        var chaCiTrailer = buildChaCiTrailer_(sqcCode, prefTradeCodeVal, invoiceCodeVal, countryOfOriginVal);
         if (chaCiTrailer) it.description_cha_ci += '\n' + chaCiTrailer;
       }
     }
   });
-
-  // ── Invoice_Descriptions override — highest priority, applied last ───────
-  // One row per invoice, exact text typed once per document. Completely
-  // bypasses the per-model Descriptions tab AND the auto-generated CI/CHA
-  // blocks above when a cell here is filled in. No per-vehicle data, no
-  // Stock/CONTROL setup needed — this is the simplest path.
-  var invoiceDescSheet = ss.getSheetByName(INVOICE_DESC_TAB_NAME_);
-  if (invoiceDescSheet && items.length > 0) {
-    // PROFORMA shipments are looked up by pi_invoice_no (col B), everything
-    // else by invoice_no (col A) — same row can carry both numbers so it
-    // answers to either stage of the same shipment. See header note above.
-    var invoiceDescKeyCol = (String(payloadMode).trim() === 'PROFORMA') ? 1 : 0;
-    var invoiceDescRow = null;
-    invoiceDescSheet.getRange('A4:K2000').getValues().some(function(row) {
-      if (row[invoiceDescKeyCol] && sameInvoice_(row[invoiceDescKeyCol], inv)) { invoiceDescRow = row; return true; }
-      return false;
-    });
-    if (invoiceDescRow) {
-      Logger.log('📋 INVOICE_DESCRIPTIONS override found for invoice="' + inv + '" (matched via ' +
-        (invoiceDescKeyCol === 1 ? 'pi_invoice_no' : 'invoice_no') + ')');
-      // Fields where the template loops per model row but the invoice-level
-      // text should still print exactly once, on the first row — put the
-      // full text on the first item only, blank the rest, so a bulk
-      // shipment-wide description never repeats once per model/price group.
-      var concatFields = [
-        ['description_commercial', 2], ['description_packing', 4],
-        ['description_tax', 5], ['description_pi', 6], ['description', 6],
-        ['description_cha_ti', 8], ['description_cha_pl', 9], ['description_cha_ci', 10]
-      ];
-      concatFields.forEach(function(pair) {
-        var text = String(invoiceDescRow[pair[1]] || '').trim();
-        if (!text) return;
-        items[0][pair[0]] = text;
-        for (var ri = 1; ri < items.length; ri++) items[ri][pair[0]] = '';
-      });
-      // Fields where the template does NOT loop per item row (SCOMET
-      // Declaration uses a single scomet_product_desc field; Annexure_1
-      // loops vin_list, not items) — same text can safely apply to every
-      // item since only items[0]'s value ever actually gets read downstream.
-      var perRowFields = [
-        ['description_scomet', 3], ['description_annexure1', 7]
-      ];
-      perRowFields.forEach(function(pair) {
-        var text = String(invoiceDescRow[pair[1]] || '').trim();
-        if (!text) return;
-        items.forEach(function(it) { it[pair[0]] = text; });
-      });
-    }
-  }
 
   // Snapshot the final, fully-resolved description text into the
   // Invoice_Descriptions tab's read-only preview columns — see
@@ -1647,14 +1956,14 @@ function buildPayload(ss, ctrl, inv) {
   // `inv` (CONTROL!C8) is whichever number is active THIS run — invoice_no
   // for FINAL/DRAFT, pi_invoice_no for PROFORMA. The OTHER stage's number,
   // if this shipment was ever generated under it too, already sits on these
-  // same Stock rows (col H / col S) since assignment writes whichever
+  // same Stock rows (col H / col M) since assignment writes whichever
   // column matched the mode active at assignment time — reading both here
   // is what lets the two stages consolidate into one preview row.
   var previewInvoiceNo   = (String(payloadMode).trim() === 'PROFORMA') ? '' : inv;
   var previewPiInvoiceNo = (String(payloadMode).trim() === 'PROFORMA') ? inv : '';
   for (var pmi = 0; pmi < rawMatchedRows.length; pmi++) {
     if (!previewInvoiceNo)   previewInvoiceNo   = String(rawMatchedRows[pmi][7] || '').trim();
-    if (!previewPiInvoiceNo) previewPiInvoiceNo = String(rawMatchedRows[pmi][18] || '').trim();
+    if (!previewPiInvoiceNo) previewPiInvoiceNo = String(rawMatchedRows[pmi][12] || '').trim();
     if (previewInvoiceNo && previewPiInvoiceNo) break;
   }
   writeDescriptionPreview_(ss, previewInvoiceNo, previewPiInvoiceNo, items);
@@ -1779,13 +2088,12 @@ function buildPayload(ss, ctrl, inv) {
 }
 
 // ── Preview descriptions only — no documents generated ──────────────────────
-// buildPayload() already resolves every description (Products default →
-// Descriptions-tab override → auto-generated VIN/CI blocks → Invoice_
-// Descriptions override) and writes the result into the Invoice_Descriptions
-// preview columns as a side effect — this just calls buildPayload() and
-// stops there, skipping the UrlFetchApp call that actually creates .docx
-// files. Respects whatever vehicles are currently selected/assigned: the
-// same C17 "Select Vehicles for Generation" subset filter buildPayload()
+// buildPayload() already resolves every description (Products tab default,
+// or the auto-generated per-vehicle VIN/CI block) and writes the result into
+// the Invoice_Descriptions preview columns as a side effect — this just
+// calls buildPayload() and stops there, skipping the UrlFetchApp call that
+// actually creates .docx files. Respects whatever vehicles are currently
+// selected/assigned: the same C17 "Select Vehicles for Generation" subset filter buildPayload()
 // always applies, so previewing after narrowing to a partial selection
 // shows exactly what THAT subset would print, not the whole invoice.
 function generateDescriptionPreview() {
@@ -1803,7 +2111,7 @@ function generateDescriptionPreview() {
     logAudit(inv, 'DESCRIPTION_PREVIEW', payload.vehicles.length + ' vehicle(s), ' + payload.items.length + ' model group(s)');
     ui.alert('✅ Description Preview Updated',
       'Resolved descriptions for invoice ' + inv + ' (' + payload.vehicles.length + ' vehicle(s) currently selected/assigned) ' +
-      'and wrote them to the Invoice_Descriptions tab, columns M onward.\n\n' +
+      'and wrote them to the Invoice_Descriptions tab, columns C onward.\n\n' +
       'No documents were generated — this only updates the preview so you can check the wording first.',
       ui.ButtonSet.OK);
   } catch (err) {
@@ -2108,11 +2416,11 @@ function showVehicleSidebar() {
   const invoice = ctrl.getRange(CFG.invoiceNoCell).getValue();
   const qty     = Number(ctrl.getRange(CFG.qtyCell).getValue()) || 0;
   const sideMode  = ctrl.getRange(CFG.modeCell).getValue() || 'FINAL';
-  const sideInvCol = (sideMode === 'PROFORMA') ? 18 : 7;  // col S(18) for PROFORMA, col H(7) for FINAL/DRAFT
+  const sideInvCol = (sideMode === 'PROFORMA') ? 12 : 7;  // col M(12) PI Invoice No for PROFORMA, col H(7) assigned_to for FINAL/DRAFT
 
   if (!invoice) { SpreadsheetApp.getUi().alert('❌ No invoice number found in C8.'); return; }
 
-  const data    = stock.getRange('A4:S2000').getValues();
+  const data    = stock.getRange('A4:R2000').getValues();
   const visible = data.filter(function(r) { return r[0] && (r[6] === 'AVAILABLE' || sameInvoice_(r[sideInvCol], invoice)); });
   const alreadyAssigned = data.filter(function(r) { return r[0] && sameInvoice_(r[sideInvCol], invoice); }).length;
 
@@ -2214,10 +2522,11 @@ function assignVehiclesFromSidebar(chassisList, invoiceNo) {
   const ctrl  = ss.getSheetByName('CONTROL');
   const stock = getSelectedStockSheet_(ss, ctrl);
   const assignMode   = ctrl.getRange(CFG.modeCell).getValue() || 'FINAL';
-  const invCol0      = (assignMode === 'PROFORMA') ? 18 : 7;   // 0-based: col S(18) or col H(7)
-  const invColNum    = (assignMode === 'PROFORMA') ? 19 : 8;   // 1-based: col S(19) or col H(8)
-  const data  = stock.getRange('A4:S2000').getValues();
+  const invCol0      = (assignMode === 'PROFORMA') ? 12 : 7;   // 0-based: col M(12) PI Invoice No or col H(7) assigned_to
+  const invColNum    = (assignMode === 'PROFORMA') ? 13 : 8;   // 1-based: col M(13) PI Invoice No or col H(8) assigned_to
+  const data  = stock.getRange('A4:R2000').getValues();
   const info  = getCustomerInfo_(ss);
+  const piDateVal = ctrl.getRange(CFG.dateCell).getValue();
   let assigned = 0, released = 0;
   data.forEach(function(row, i) {
     if (!row[0]) return;
@@ -2225,14 +2534,22 @@ function assignVehiclesFromSidebar(chassisList, invoiceNo) {
     if (chassisList.indexOf(chassis) !== -1) {
       stock.getRange(i+4, 7).setValue('RESERVED');
       stock.getRange(i+4, invColNum).setValue(invoiceNo);
-      stock.getRange(i+4, 17).setValue(info.companyName);  // col Q = company_name
-      stock.getRange(i+4, 18).setValue(info.contactName);  // col R = contact_name
+      stock.getRange(i+4, 11).setValue(info.companyName);  // col K = customer_name
+      stock.getRange(i+4, 12).setValue(info.contactName);  // col L = company_name
+      // Stamp the PI generation date once, the first time this vehicle is
+      // assigned under PROFORMA — never overwritten afterward, so it still
+      // reflects the ORIGINAL Proforma date even once the shipment moves to
+      // FINAL. See STOCK_PI_DATE_COL_ note above.
+      if (assignMode === 'PROFORMA') {
+        var piDateCell = stock.getRange(i+4, STOCK_PI_DATE_COL_);
+        if (!piDateCell.getValue()) piDateCell.setValue(piDateVal);
+      }
       assigned++;
     } else if (sameInvoice_(row[invCol0], invoiceNo)) {
       stock.getRange(i+4, 7).setValue('AVAILABLE');
       stock.getRange(i+4, invColNum).setValue('');
-      stock.getRange(i+4, 17).setValue('');  // col Q
-      stock.getRange(i+4, 18).setValue('');  // col R
+      stock.getRange(i+4, 11).setValue('');  // col K
+      stock.getRange(i+4, 12).setValue('');  // col L
       released++;
     }
   });
@@ -2255,10 +2572,10 @@ function bulkAssignByModel() {
   if (qty <= 0) return ui.alert('❌ Quantity is Zero', 'Update quantity in C26 first.', ui.ButtonSet.OK);
 
   const bulkMode   = ctrl.getRange(CFG.modeCell).getValue() || 'FINAL';
-  const bulkInvCol0   = (bulkMode === 'PROFORMA') ? 18 : 7;   // 0-based: col S(18) or col H(7)
-  const bulkInvColNum = (bulkMode === 'PROFORMA') ? 19 : 8;   // 1-based: col S(19) or col H(8)
+  const bulkInvCol0   = (bulkMode === 'PROFORMA') ? 12 : 7;   // 0-based: col M(12) PI Invoice No or col H(7) assigned_to
+  const bulkInvColNum = (bulkMode === 'PROFORMA') ? 13 : 8;   // 1-based: col M(13) PI Invoice No or col H(8) assigned_to
 
-  const alreadyAssigned = stock.getRange('A4:S2000').getValues()
+  const alreadyAssigned = stock.getRange('A4:R2000').getValues()
     .filter(function(r) { return sameInvoice_(r[bulkInvCol0], inv); }).length;
   if (alreadyAssigned >= qty)
     return ui.alert('✅ Already Fully Assigned',
@@ -2279,7 +2596,7 @@ function bulkAssignByModel() {
   // could never match a query like "PULSAR BLACK".
   const filterTokens = filter.split(/\s+/).filter(Boolean);
 
-  const allData = stock.getRange('A4:S2000').getValues();
+  const allData = stock.getRange('A4:R2000').getValues();
   const matches = [];
   for (var i = 0; i < allData.length; i++) {
     const row = allData[i];
@@ -2314,11 +2631,17 @@ function bulkAssignByModel() {
     return ui.alert('Cancelled', 'No changes were made.', ui.ButtonSet.OK);
 
   const info = getCustomerInfo_(ss);
+  const bulkPiDateVal = ctrl.getRange(CFG.dateCell).getValue();
   toAssign.forEach(function(v) {
     stock.getRange(v.rowIndex+4, 7).setValue('RESERVED');
     stock.getRange(v.rowIndex+4, bulkInvColNum).setValue(inv);
-    stock.getRange(v.rowIndex+4, 17).setValue(info.companyName);
-    stock.getRange(v.rowIndex+4, 18).setValue(info.contactName);
+    stock.getRange(v.rowIndex+4, 11).setValue(info.companyName);
+    stock.getRange(v.rowIndex+4, 12).setValue(info.contactName);
+    // Stamp the PI generation date once — see STOCK_PI_DATE_COL_ note above.
+    if (bulkMode === 'PROFORMA') {
+      var bulkPiDateCell = stock.getRange(v.rowIndex+4, STOCK_PI_DATE_COL_);
+      if (!bulkPiDateCell.getValue()) bulkPiDateCell.setValue(bulkPiDateVal);
+    }
   });
 
   logAudit(inv, 'BULK_ASSIGN', willAssign + ' "' + filter + '" assigned' +
@@ -2346,8 +2669,8 @@ function cloneLastShipment() {
 
   if (currentInv && stock) {
     const cloneMode   = ctrl.getRange(CFG.modeCell).getValue() || 'FINAL';
-    const cloneInvCol = (cloneMode === 'PROFORMA') ? 18 : 7;
-    const reserved = stock.getRange('A4:S2000').getValues()
+    const cloneInvCol = (cloneMode === 'PROFORMA') ? 12 : 7;  // col M PI Invoice No, or col H assigned_to
+    const reserved = stock.getRange('A4:R2000').getValues()
       .filter(function(r) { return sameInvoice_(r[cloneInvCol], currentInv); }).length;
     if (reserved > 0 && currentQty > 0 && reserved < currentQty) {
       if (ui.alert('⚠ Incomplete Assignment',
@@ -2540,7 +2863,8 @@ function quickAddProducts(models, qtys, prices) {
   const inv   = ctrl.getRange(CFG.invoiceNoCell).getValue();
   if (!inv) throw new Error('No invoice number found in C8.');
   const qaMode    = ctrl.getRange(CFG.modeCell).getValue() || 'FINAL';
-  const qaInvColNum = (qaMode === 'PROFORMA') ? 19 : 8;  // 1-based: col S(19) or col H(8)
+  const qaInvColNum = (qaMode === 'PROFORMA') ? 13 : 8;  // 1-based: col M(13) PI Invoice No or col H(8) assigned_to
+  const qaPiDateVal = ctrl.getRange(CFG.dateCell).getValue();
 
   let totalAdded = 0;
   for (var i = 0; i < models.length; i++) {
@@ -2552,7 +2876,10 @@ function quickAddProducts(models, qtys, prices) {
       stock.getRange(row, 3).setValue(models[i]);
       stock.getRange(row, 7).setValue('RESERVED');
       stock.getRange(row, qaInvColNum).setValue(inv);
-      stock.getRange(row, 10).setValue(prices[i]);
+      stock.getRange(row, 9).setValue(prices[i]);
+      // Freshly created rows — stamp the PI date directly, no need to check
+      // for an existing value. See STOCK_PI_DATE_COL_ note above.
+      if (qaMode === 'PROFORMA') stock.getRange(row, STOCK_PI_DATE_COL_).setValue(qaPiDateVal);
       totalAdded++;
     }
   }
@@ -2581,8 +2908,8 @@ function showGenerationVehicleSelector() {
   if (!invoice) { ui.alert('❌ No Invoice', 'Set invoice number in C8 first.', ui.ButtonSet.OK); return; }
 
   const mode   = ctrl.getRange(CFG.modeCell).getValue() || 'FINAL';
-  const invCol = (mode === 'PROFORMA') ? 18 : 7;
-  const reserved = stock.getRange('A4:S2000').getValues()
+  const invCol = (mode === 'PROFORMA') ? 12 : 7;  // col M PI Invoice No, or col H assigned_to
+  const reserved = stock.getRange('A4:R2000').getValues()
     .filter(function(r) { return r[0] && sameInvoice_(r[invCol], invoice); });
 
   if (reserved.length === 0) {
@@ -2720,8 +3047,8 @@ function showAssignedVehiclesPanel() {
   if (!invoice) { ui.alert('❌ No Invoice', 'Set invoice number in C8 first.', ui.ButtonSet.OK); return; }
 
   const panelMode   = ctrl.getRange(CFG.modeCell).getValue() || 'FINAL';
-  const panelInvCol = (panelMode === 'PROFORMA') ? 18 : 7;
-  const allData  = stock.getRange('A4:S2000').getValues();
+  const panelInvCol = (panelMode === 'PROFORMA') ? 12 : 7;  // col M PI Invoice No, or col H assigned_to
+  const allData  = stock.getRange('A4:R2000').getValues();
   const assigned = allData.filter(function(r) { return r[0] && sameInvoice_(r[panelInvCol], invoice); });
 
   if (assigned.length === 0) {
@@ -2736,7 +3063,7 @@ function showAssignedVehiclesPanel() {
     const model = r[2] || 'Unknown';
     if (!modelSummary[model]) modelSummary[model] = { count: 0, prices: [] };
     modelSummary[model].count++;
-    if (r[9]) modelSummary[model].prices.push(Number(r[9]));
+    if (r[8]) modelSummary[model].prices.push(Number(r[8]));
   });
 
   const summaryRows = Object.keys(modelSummary).map(function(model) {
@@ -2751,7 +3078,7 @@ function showAssignedVehiclesPanel() {
       '<td style="padding:5px 8px;font-size:12px">' + r[2] + '</td>' +
       '<td style="padding:5px 8px;font-size:11px;color:#64748b">' + (r[3]||'') + '</td>' +
       '<td style="padding:5px 8px;font-size:11px;color:#64748b">' + (r[4]||'') + '</td>' +
-      '<td style="padding:5px 8px;font-size:11px;text-align:right;color:#0f766e;font-weight:600">' + (r[9]?'USD '+r[9]:'') + '</td></tr>';
+      '<td style="padding:5px 8px;font-size:11px;text-align:right;color:#0f766e;font-weight:600">' + (r[8]?'USD '+r[8]:'') + '</td></tr>';
   }).join('');
 
   ui.showModelessDialog(HtmlService.createHtmlOutput(
@@ -2908,16 +3235,16 @@ function buildCustomerDropdownRule_(custSheet) {
   const rule = SpreadsheetApp.newDataValidation()
     .requireValueInList(dropValues, true)
     .setAllowInvalid(true)
-    .setHelpText('Pick customer — name and company auto-fill into Q and R')
+    .setHelpText('Pick customer — name and company auto-fill into K and L')
     .build();
   return { rule: rule, values: dropValues };
 }
 
 function applyCustomerDropdownToSheet_(stockSheet, rule) {
-  if (!stockSheet.getRange(1, 17).getValue()) stockSheet.getRange(1, 17).setValue('customer_name');
-  if (!stockSheet.getRange(1, 18).getValue()) stockSheet.getRange(1, 18).setValue('company_name');
+  if (!stockSheet.getRange(1, 11).getValue()) stockSheet.getRange(1, 11).setValue('customer_name');
+  if (!stockSheet.getRange(1, 12).getValue()) stockSheet.getRange(1, 12).setValue('company_name');
   const lastRow = Math.max(stockSheet.getLastRow(), 4);
-  stockSheet.getRange(4, 17, lastRow - 3, 1).setDataValidation(rule);
+  stockSheet.getRange(4, 11, lastRow - 3, 1).setDataValidation(rule);
 }
 
 function setupCustomerDropdowns() {
@@ -2948,9 +3275,9 @@ function setupCustomerDropdowns() {
 
   ui.alert(
     '✅ Customer Dropdowns Ready',
-    built.values.length + ' customer(s) loaded into column Q across ' + stockSheets.length + ' Stock tab(s): ' +
+    built.values.length + ' customer(s) loaded into column K across ' + stockSheets.length + ' Stock tab(s): ' +
     stockSheets.map(function(s) { return s.getName(); }).join(', ') + '.\n\n' +
-    'Picking from the dropdown auto-fills:\n• Q = Contact Name\n• R = Company Name',
+    'Picking from the dropdown auto-fills:\n• K = Contact Name\n• L = Company Name',
     ui.ButtonSet.OK
   );
 }

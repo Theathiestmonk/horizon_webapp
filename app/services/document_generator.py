@@ -191,8 +191,7 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
     # existing model-level HSN in buildPayload() (script.gs) when a Stock tab
     # override is blank, so this only ever changes output once an override
     # is actually filled in. Runs before context['item'] (singular, below) is
-    # copied from items[0], so PI FORMAT / Tax Invoice's merged single row
-    # picks up the already-swapped value too.
+    # copied from items[0], so that also picks up the already-swapped value.
     hsn_field = TEMPLATE_HSN_FIELD.get(template_name, "")
     if hsn_field and isinstance(context.get('items'), list):
         for it in context['items']:
@@ -229,30 +228,16 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
         first['total']      = first['amount_usd']
         context['item'] = first
 
-    # ── PI FORMAT / Tax Invoice — single merged row per invoice ─────────────
-    # These two summarize the whole shipment as one line, not a per-model
-    # breakdown (that's what Commercial Invoice / CHA CI/TI/PL are for).
-    # Quantity and amount are summed across every model/price group; HSN
-    # codes are joined (not silently dropped) when models differ, so the
-    # single row still discloses every code instead of only the first one.
-    if template_name in ("PI FORMAT.docx", "Tax_Invoice.docx") and isinstance(context.get('items'), list) and context['items']:
-        items_list = [it for it in context['items'] if isinstance(it, dict)]
-        if items_list:
-            merged = dict(items_list[0])
-            merged['quantity']   = sum(it.get('quantity', 0) for it in items_list)
-            merged['amount_usd'] = sum(it.get('amount_usd', 0) for it in items_list)
-            merged['total']      = merged['amount_usd']
-            merged['unit_price'] = merged.get('rate_per_unit', 0)
-            hsn_codes = []
-            for it in items_list:
-                code = it.get('hsn_code', '')
-                if code and code not in hsn_codes:
-                    hsn_codes.append(code)
-            merged['hsn_code'] = ' / '.join(hsn_codes)
-            merged['sr_no'] = 1
-            merged['sr_start'] = 1
-            merged['sr_end'] = merged['quantity']
-            context['items'] = [merged]
+    # PI FORMAT.docx and Tax_Invoice.docx both use a native docxtpl row-loop
+    # ({%tr for item in items %}, referencing item.hsn_code/description/
+    # quantity/rate_per_unit/amount_usd — Tax_Invoice also uses item.sr_start/
+    # sr_end) — they were already built to print one row per model, same as
+    # Commercial Invoice / CHA CI/TI/PL. A previous version of this function
+    # collapsed context['items'] into one merged summary row here, which
+    # fought the template's own design and silently dropped every model but
+    # the first from the description. Removed — context['items'] (with each
+    # item's sr_no/sr_start/sr_end already set above) now renders as-is, one
+    # row per model, exactly like the other multi-model documents.
 
     # ── vin_list for Annexure_1 ({% for v in vin_list %}) ──────────────────
     if isinstance(context.get('vehicles'), list):

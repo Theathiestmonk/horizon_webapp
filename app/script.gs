@@ -928,16 +928,19 @@ function onOpen() {
     .addSeparator()
     .addItem('🔄 Refresh Chassis Dropdown',    'updateChassisDropdown')
     .addItem('👤 Set Customer Dropdowns (Stock K/L)', 'setupCustomerDropdowns')
+    .addItem('🔄 Refresh Customer Dropdown List (after deleting customers)', 'forceRefreshCustomerDropdowns')
     .addSeparator()
     .addItem('📋 Setup Invoice Descriptions Tab (simplest — one row per invoice)', 'setupInvoiceDescriptionsTab')
     .addItem('📊 Refresh Dashboard',           'refreshDashboardManual_')
     .addToUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
   updateChassisDropdown();
-  refreshStockTabDropdown_(SpreadsheetApp.getActiveSpreadsheet());
-  ensureCustomsFieldsLabels_(SpreadsheetApp.getActiveSpreadsheet());
-  ensureStockExtraColumnsAllTabs_(SpreadsheetApp.getActiveSpreadsheet());
-  ensureProductsExtraColumns_(SpreadsheetApp.getActiveSpreadsheet());
-  refreshDashboard_(SpreadsheetApp.getActiveSpreadsheet());
+  refreshStockTabDropdown_(ss);
+  ensureCustomsFieldsLabels_(ss);
+  ensureStockExtraColumnsAllTabs_(ss);
+  ensureProductsExtraColumns_(ss);
+  ensureCustomerSmartDropdownColumn_(ss);
+  refreshDashboard_(ss);
 }
 
 function onEdit(e) {
@@ -979,6 +982,15 @@ function onEdit(e) {
       sheet.getRange(row, 11).setValue(val.substring(0, sep).trim());
       sheet.getRange(row, 12).setValue(val.substring(sep + 3).trim());
     }
+  }
+
+  // Auto-refresh customer dropdowns silently when any cell on the Customers sheet is edited
+  // Triggers on ANY edit (not just data rows) to catch deletions, formula changes, etc.
+  if (name === 'Customers') {
+    Utilities.sleep(500);  // brief delay to ensure the change is saved
+    refreshCustomerDropdownsSilent_();
+    // Ensure smart_dropdown formula is filled in for this row (if row >= 2, i.e., not header)
+    if (row >= 2) ensureCustomerSmartDropdownFormula_(sheet, row);
   }
 }
 
@@ -1899,6 +1911,8 @@ function buildPayload(ss, ctrl, inv) {
   var lastModelRomanIdx = 0;
 
   items.forEach(function(it, idx) {
+    // Add simple row number for templates (01, 02, 03... per product/item row)
+    it.row_number = String(idx + 1).padStart(2, '0');
     var genProd = productMap[it.model_key] || null;
     var engineCc     = genProd ? String(genProd[16] || '').trim() : '';  // engine_cc
     var make         = genProd ? String(genProd[17] || '').trim() : '';  // make
@@ -2075,8 +2089,8 @@ function buildPayload(ss, ctrl, inv) {
 
     lc_number:             String(ctrl.getRange(CFG.lcCell).getValue() || ''),
     buyers_order_no:       String(ctrl.getRange('C15').getValue() || ''),
-    notify_1:              String(ctrl.getRange(CFG.notifyCell1).getValue() || ''),
-    notify_2:              String(ctrl.getRange(CFG.notifyCell2).getValue() || ''),
+    notify_1:              '',  // Null for backend to populate; client fills manually in doc if needed
+    notify_2:              '',  // Null for backend to populate; client fills manually in doc if needed
     terms_of_payment:      String(ctrl.getRange(CFG.termsOfPaymentCell || 'C23').getValue() || ''),
     company_seal_no:       '',
     shipping_line_seal_no: '',
@@ -2286,23 +2300,7 @@ function generateCHADocuments() {
     if (code === 200 || code === 201) {
       logAudit(inv, 'CHA_GENERATED', 'CHA TI + CHA PL + CHA CI');
       const parsed = JSON.parse(body);
-      const files  = parsed.generated_files || [];
-      if (files.length === 0) {
-        ui.alert('⚠ CHA Generated', 'Documents processed but no download links returned.\nCheck backend logs.', ui.ButtonSet.OK);
-        return;
-      }
-      const links = files.map(function(f) {
-        return '<p style="margin:8px 0"><a href="' + f.gcs_url + '" target="_blank" style="background:#1e3a5f;color:white;padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:13px">⬇️ ' + f.download_name + '</a></p>';
-      }).join('');
-      SpreadsheetApp.getUi().showModalDialog(
-        HtmlService.createHtmlOutput(
-          '<style>body{font-family:Arial,sans-serif;padding:20px;text-align:center}</style>' +
-          '<h3 style="color:#1e3a5f">✅ CHA Documents Generated</h3>' +
-          '<p><strong>Invoice:</strong> ' + inv + '</p>' +
-          links
-        ).setWidth(500).setHeight(220),
-        'CHA Documents — ' + inv
-      );
+      showDownloadDialog(parsed, inv);
     } else {
       logAudit(inv, 'CHA_FAILED', 'HTTP ' + code);
       ui.alert('❌ CHA Generation Failed (HTTP ' + code + ')', body.substring(0, 800), ui.ButtonSet.OK);
@@ -3236,7 +3234,11 @@ function saveExporterBankDetails(vals) {
 // ensureMonthlyStockTab_() (applies automatically to a freshly created tab).
 function buildCustomerDropdownRule_(custSheet) {
   if (!custSheet) return null;
-  const custData   = custSheet.getRange('A2:L2000').getValues();
+  // Find the actual last row with data instead of using a fixed 2000
+  var lastRow = custSheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const custData   = custSheet.getRange('A2:L' + lastRow).getValues();
   const dropValues = [];
   for (var i = 0; i < custData.length; i++) {
     var val = String(custData[i][11]).trim();  // col L = smart_dropdown
@@ -3254,10 +3256,33 @@ function buildCustomerDropdownRule_(custSheet) {
 function applyCustomerDropdownToSheet_(stockSheet, rule) {
   if (!stockSheet.getRange(1, 11).getValue()) stockSheet.getRange(1, 11).setValue('customer_name');
   if (!stockSheet.getRange(1, 12).getValue()) stockSheet.getRange(1, 12).setValue('company_name');
-  const lastRow = Math.max(stockSheet.getLastRow(), 4);
-  stockSheet.getRange(4, 11, lastRow - 3, 1).setDataValidation(rule);
+  // Apply to a large fixed range (rows 4-2000) to cover all current and future data rows
+  // This matches the A4:R2000 range used throughout the script
+  stockSheet.getRange(4, 11, 1997, 1).setDataValidation(rule);
 }
 
+// Silent version — runs automatically without showing alerts (called from onEdit)
+function refreshCustomerDropdownsSilent_() {
+  const ss        = SpreadsheetApp.getActiveSpreadsheet();
+  const custSheet  = ss.getSheetByName('Customers');
+
+  if (!custSheet) return;  // silent fail if no Customers sheet
+
+  const stockSheets = [];
+  const legacy = ss.getSheetByName('Stock');
+  if (legacy) stockSheets.push(legacy);
+  listStockTabNames_(ss).forEach(function(n) { stockSheets.push(ss.getSheetByName(n)); });
+
+  if (stockSheets.length === 0) return;  // silent fail if no Stock sheets
+
+  const built = buildCustomerDropdownRule_(custSheet);
+  if (!built) return;  // silent fail if no customers
+
+  stockSheets.forEach(function(stockSheet) { applyCustomerDropdownToSheet_(stockSheet, built.rule); });
+  Logger.log('✅ Customer dropdowns auto-refreshed | ' + built.values.length + ' customer(s)');
+}
+
+// Manual version — shows confirmation popup (called from menu)
 function setupCustomerDropdowns() {
   const ss        = SpreadsheetApp.getActiveSpreadsheet();
   const custSheet  = ss.getSheetByName('Customers');
@@ -3291,4 +3316,82 @@ function setupCustomerDropdowns() {
     'Picking from the dropdown auto-fills:\n• K = Contact Name\n• L = Company Name',
     ui.ButtonSet.OK
   );
+}
+
+// Ensures the smart_dropdown formula is filled in for a given row in the Customers sheet
+// Formula: =IF(G{row}="","",G{row}&" — "&B{row})
+// This gets called automatically when any row in the Customers sheet is edited (onEdit)
+function ensureCustomerSmartDropdownFormula_(custSheet, row) {
+  if (!custSheet || row < 2) return;  // row 1 is header, data starts at row 2
+  var smartDropdownCell = custSheet.getRange(row, 12);  // column L = smart_dropdown
+  var currentValue = String(smartDropdownCell.getValue() || '').trim();
+
+  // Only fill if the cell is empty or doesn't look like our expected formula
+  if (!currentValue || (!currentValue.startsWith('=') && !currentValue.includes(' — '))) {
+    var formula = '=IF(G' + row + '="","",G' + row + '&" — "&B' + row + ')';
+    smartDropdownCell.setFormula(formula);
+  }
+}
+
+// Ensures the smart_dropdown formula (col L) is pre-filled across rows 2-2000 in Customers sheet
+// New rows automatically inherit the formula, so you don't need to manually add it
+// Called from onOpen() to self-heal on every spreadsheet open
+function ensureCustomerSmartDropdownColumn_(ss) {
+  var custSheet = ss.getSheetByName('Customers');
+  if (!custSheet) return;
+
+  var range = custSheet.getRange(2, 12, 1999, 1);  // rows 2-2000, column L
+  var values = range.getFormulas();
+  var hasFormulas = values.some(function(row) {
+    return String(row[0]).startsWith('=');
+  });
+
+  // Only fill if the range doesn't already have formulas (prevents re-running unnecessary batch operations)
+  if (!hasFormulas) {
+    var formulas = [];
+    for (var i = 2; i <= 2000; i++) {
+      formulas.push(['=IF(G' + i + '="","",G' + i + '&" — "&B' + i + ')']);
+    }
+    range.setFormulas(formulas);
+  }
+}
+
+// Manual refresh for customer dropdowns — use this after bulk deleting customers from the Customers sheet
+// to ensure the Stock sheet dropdowns don't show deleted customer names anymore
+function forceRefreshCustomerDropdowns() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const custSheet = ss.getSheetByName('Customers');
+  const ui = SpreadsheetApp.getUi();
+
+  if (!custSheet) {
+    ui.alert('❌ No Customers Sheet', 'Could not find the Customers sheet.', ui.ButtonSet.OK);
+    return;
+  }
+
+  // Rebuild the customer dropdown list from current Customers sheet data
+  const built = buildCustomerDropdownRule_(custSheet);
+  if (!built) {
+    ui.alert('⚠ No Customers Found', 'The Customers sheet has no smart_dropdown values in column L.', ui.ButtonSet.OK);
+    return;
+  }
+
+  // Apply the refreshed list to every Stock sheet
+  const stockSheets = [];
+  const legacy = ss.getSheetByName('Stock');
+  if (legacy) stockSheets.push(legacy);
+  listStockTabNames_(ss).forEach(function(n) { stockSheets.push(ss.getSheetByName(n)); });
+
+  if (stockSheets.length === 0) {
+    ui.alert('❌ No Stock Sheets', 'Could not find any Stock tab.', ui.ButtonSet.OK);
+    return;
+  }
+
+  stockSheets.forEach(function(stockSheet) { applyCustomerDropdownToSheet_(stockSheet, built.rule); });
+
+  logAudit('SYSTEM', 'CUSTOMER_DROPDOWN_REFRESHED', 'Manual refresh: ' + built.values.length + ' customer(s) across ' + stockSheets.length + ' Stock tab(s)');
+  ui.alert('✅ Customer Dropdowns Refreshed',
+    'Updated all ' + stockSheets.length + ' Stock sheet(s) with the current ' + built.values.length + ' customer(s).\n\n' +
+    'Deleted customers are no longer available in the dropdown.\n' +
+    'Stock sheets: ' + stockSheets.map(function(s) { return s.getName(); }).join(', '),
+    ui.ButtonSet.OK);
 }

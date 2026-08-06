@@ -181,8 +181,16 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
     desc_field = TEMPLATE_DESC_FIELD.get(template_name, "")
     if desc_field and isinstance(context.get('items'), list):
         for it in context['items']:
-            if isinstance(it, dict) and desc_field in it:
-                it['description'] = it[desc_field]
+            if isinstance(it, dict):
+                # Always set 'description', even if the source field is missing (use fallback to description_pi)
+                if desc_field in it:
+                    it['description'] = it[desc_field]
+                elif 'description_pi' in it:
+                    # Fallback to description_pi if the template-specific field doesn't exist
+                    it['description'] = it['description_pi']
+                else:
+                    # Last resort: use empty string
+                    it['description'] = ''
 
     # ── Swap item.hsn_code per template ──────────────────────────────────────
     # hsn_code_user_country feeds Commercial_Invoice/Tax_Invoice/Packing_List,
@@ -210,6 +218,14 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
             it['sr_start'] = _running_item + 1
             it['sr_end']   = _running_item + _qty
             _running_item += _qty
+            # Ensure all description fields exist (fallback to empty string if missing)
+            for desc_key in ['description', 'description_commercial', 'description_scomet',
+                            'description_packing', 'description_tax', 'description_pi',
+                            'description_annexure1', 'description_cha_ti', 'description_cha_pl', 'description_cha_ci']:
+                it.setdefault(desc_key, '')
+            # Ensure HSN fields exist
+            for hsn_key in ['hsn_code', 'hsn_code_pi', 'hsn_code_india', 'hsn_code_user_country']:
+                it.setdefault(hsn_key, '')
 
     # ── total_quantity across all items ─────────────────────────────────────
     context['total_quantity'] = sum(
@@ -325,17 +341,21 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
 def generate_document(template_name: str, payload: Any, invoice_no: str) -> Dict[str, Any]:
     safe_invoice = sanitize_filename(invoice_no)
     logger.info(f"[{invoice_no}] Generating {template_name}")
-    
+
     try:
         template_path = TEMPLATE_DIR / template_name
         if not template_path.exists():
             raise FileNotFoundError(f"Template not found: {template_path}")
-        
+
         context = build_context(payload, template_name=template_name)
-        
+
         logger.info(f"Rendering template {template_name} with {len(context)} context keys")
-        logger.debug(f"Context keys: {list(context.keys())}")   # Helpful for debugging
-        
+        logger.info(f"Items in context: {len(context.get('items', []))} | Vehicles: {len(context.get('vehicles', []))}")
+        if context.get('items'):
+            for idx, item in enumerate(context['items'][:2]):  # Log first 2 items for debugging
+                if isinstance(item, dict):
+                    logger.info(f"  Item[{idx}]: hsn={item.get('hsn_code')} qty={item.get('quantity')} desc_comm={bool(item.get('description_commercial'))}")
+
         doc = DocxTemplate(str(template_path))
         doc.render(context) 
         

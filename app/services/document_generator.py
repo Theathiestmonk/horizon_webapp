@@ -34,7 +34,7 @@ TEMPLATE_DESC_FIELD = {
 # Indian customs/export filings. See the HSN resolution block in
 # buildPayload() (script.gs).
 TEMPLATE_HSN_FIELD = {
-    "PI FORMAT.docx":              "hsn_code_user_country",
+    "PI FORMAT.docx":              "hsn_code_pi",
     "Commercial_Invoice.docx":     "hsn_code_user_country",
     "Tax_Invoice.docx":            "hsn_code_user_country",
     "Packing_List.docx":           "hsn_code_user_country",

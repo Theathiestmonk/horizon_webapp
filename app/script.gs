@@ -1625,12 +1625,18 @@ function buildPayload(ss, ctrl, inv) {
   // forever. Never overwrites a date that's already recorded.
   if (String(payloadMode).trim() === 'PROFORMA') {
     var piDateStampVal = ctrl.getRange(CFG.dateCell).getValue();
+    Logger.log('📅 PROFORMA mode — checking pi_invoice_date backfill | dateValue=' + piDateStampVal + ' | vehicles=' + rawMatchedRows.length);
     for (var vi = 0; vi < rawMatchedRows.length; vi++) {
       if (!rawMatchedRows[vi][20]) {  // col U, 0-based index 20
+        Logger.log('  ✏️ Backfilling pi_invoice_date for vehicle ' + vi + ' at row ' + matchedRowNumbers[vi]);
         stock.getRange(matchedRowNumbers[vi], STOCK_PI_DATE_COL_).setValue(piDateStampVal);
         vehicles[vi].pi_invoice_date = formatDdMmYyyy_(piDateStampVal);
+      } else {
+        Logger.log('  ⏭️ Skipping vehicle ' + vi + ' — pi_invoice_date already set: ' + rawMatchedRows[vi][20]);
       }
     }
+  } else {
+    Logger.log('⏭️ Not PROFORMA mode (mode=' + payloadMode + ') — skipping pi_invoice_date backfill');
   }
 
   Logger.log('🚗 VEHICLES FOUND: ' + vehicles.length);
@@ -1826,7 +1832,7 @@ function buildPayload(ss, ctrl, inv) {
     var overridePi          = it.vehicle_list.map(function(v) { return v.hsn_code_pi; }).filter(Boolean)[0] || '';
     it.hsn_code_india        = overrideIndia || it.hsn_code;
     it.hsn_code_user_country = overrideUserCountry || it.hsn_code;
-    it.hsn_code_pi           = overridePi || it.hsn_code_pi;
+    it.hsn_code_pi           = overridePi || it.hsn_code;
   });
 
   Logger.log('📊 ITEMS BUILT: ' + items.length + ' group(s)');

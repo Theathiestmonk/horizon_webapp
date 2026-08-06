@@ -1689,15 +1689,18 @@ function buildPayload(ss, ctrl, inv) {
   // 0=product_id, 1=product_name (match key), 2=unit, 3=pref_trade_code (unused), 4=cess_amount,
   // 5=sqc_code, 6=smart_dropdown, 7=desc_packing_list, 8=desc_tax_invoice, 9=desc_PI,
   // 10=desc_annexure1, 11=CHA TI Description, 12=CHA PL Description, 13=CHA CI Description,
-  // 14=desc_commercial_invoice, 15=desc_scomet, 16=engine_cc, 17=make, 18=accessories
+  // 14=desc_commercial_invoice, 15=desc_scomet, 16=engine_cc, 17=make, 18=accessories, 19=invoice_code, 20=stock_model_name
   // (16-18 auto-appended by ensureProductsExtraColumns_ after whatever the sheet's last
   // column currently is — safe regardless of how the first 16 get reordered again).
+  // Column U (20) = stock_model_name — allows matching Stock sheet model names to Products.
   var productMap = {};
   var productSheet = ss.getSheetByName('Products');
   if (productSheet) {
-    productSheet.getRange('A3:S2000').getValues().forEach(function(row) {  // A3 skips header; S = last column incl. engine_cc/make/accessories
-      var modelKey = String(row[1]).toUpperCase().trim();  // col B = product_name (match key)
-      if (modelKey) productMap[modelKey] = row;
+    productSheet.getRange('A3:U2000').getValues().forEach(function(row) {  // A3 skips header; U = stock_model_name
+      var productKey = String(row[1]).toUpperCase().trim();  // col B = product_name (primary match key)
+      var stockModelKey = String(row[20] || '').toUpperCase().trim();  // col U = stock_model_name (alternate match key)
+      if (productKey) productMap[productKey] = row;
+      if (stockModelKey && stockModelKey !== productKey) productMap[stockModelKey] = row;  // dual-key support
     });
     Logger.log('📦 PRODUCT TAB keys (' + Object.keys(productMap).length + '): ' + Object.keys(productMap).join(', '));
   } else {
@@ -1738,15 +1741,17 @@ function buildPayload(ss, ctrl, inv) {
     // per-model source anymore (see the layout note above productMap).
     var hsnCode       = defaultHsn;
     var hsnCodePi     = defaultHsnPi;
-    var descChaTi     = prod ? (String(prod[11]).trim() || defaultDesc)     : defaultDesc;   // CHA TI Description
-    var descChaPl     = prod ? (String(prod[12]).trim() || defaultDesc)     : defaultDesc;   // CHA PL Description
-    var descChaCi     = prod ? (String(prod[13]).trim() || defaultDesc)     : defaultDesc;   // CHA CI Description
+    // Fallback chain: column-specific desc → detailed product desc (col 7=packing) → defaultDesc
+    var fallbackDesc  = prod ? (String(prod[7]).trim() || defaultDesc) : defaultDesc;  // Use detailed desc from col G as fallback
+    var descChaTi     = prod ? (String(prod[11]).trim() || fallbackDesc)     : fallbackDesc;   // CHA TI Description
+    var descChaPl     = prod ? (String(prod[12]).trim() || fallbackDesc)     : fallbackDesc;   // CHA PL Description
+    var descChaCi     = prod ? (String(prod[13]).trim() || fallbackDesc)     : fallbackDesc;   // CHA CI Description
     var productName   = prod ? (String(prod[1]).trim()  || '')               : '';            // product_name
-    var descComm      = prod ? (String(prod[14]).trim() || defaultDesc)      : defaultDesc;   // desc_commercial_invoice
-    var descScomet    = prod ? (String(prod[15]).trim() || defaultDesc)      : defaultDesc;   // desc_scomet
-    var descPacking   = prod ? (String(prod[7]).trim()  || defaultDesc)      : defaultDesc;   // desc_packing_list
-    var descTax       = prod ? (String(prod[8]).trim()  || defaultDesc)      : defaultDesc;   // desc_tax_invoice
-    var descPi        = prod ? (String(prod[9]).trim()  || defaultDesc)      : defaultDesc;   // desc_PI
+    var descComm      = prod ? (String(prod[14]).trim() || fallbackDesc)      : fallbackDesc;   // desc_commercial_invoice
+    var descScomet    = prod ? (String(prod[15]).trim() || fallbackDesc)      : fallbackDesc;   // desc_scomet
+    var descPacking   = prod ? (String(prod[7]).trim()  || fallbackDesc)      : fallbackDesc;   // desc_packing_list
+    var descTax       = prod ? (String(prod[8]).trim()  || fallbackDesc)      : fallbackDesc;   // desc_tax_invoice
+    var descPi        = prod ? (String(prod[9]).trim()  || fallbackDesc)      : fallbackDesc;   // desc_PI
     var descAnnexure1 = prod ? (String(prod[10]).trim() || descComm)         : descComm;      // desc_annexure1
     var productPrice  = 0;
     var districtCode  = defaultDistrict;

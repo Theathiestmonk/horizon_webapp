@@ -60,7 +60,7 @@ const CFG = {
   // fixed per-model property, so it moved off the Products tab onto its own
   // CONTROL cell here rather than being read via genProd[19] anymore.
   invoiceCodeCell:        'F17',
-  webhookUrl: 'https://weeks-concerts-surrounded-necessarily.trycloudflare.com/api/v1/invoices/',
+  webhookUrl: 'https://rocks-antenna-harris-surfing.trycloudflare.com/api/v1/invoices/',
 };
 
 // ── Descriptions (per-model) ────────────────────────────────────────────────
@@ -1424,7 +1424,7 @@ function formatDdMmYyyy_(v) {
 }
 
 // Commercial Invoice style block for one model group:
-//   MODEL CC (HS.CODE: x.xx.xx)
+//   MODEL CC
 //   I.  CHASSIS NO:
 //     1.<chassis1>
 //        NO OF THE EXPORT INSPECTION CERTIFICATE: <cert1>
@@ -1443,7 +1443,7 @@ function formatDdMmYyyy_(v) {
 function buildVehicleDetailBlock_(modelDisplay, engineCc, hsCodeDotted, make, vehicleGroup, chassisNumStart) {
   var lines = [];
   var ccPart = engineCc ? (String(engineCc).trim() + ' ') : '';
-  lines.push(modelDisplay + ' ' + ccPart + '(HS.CODE: ' + hsCodeDotted + ')');
+  lines.push((modelDisplay + ' ' + ccPart).trim());
 
   var romanIdx = 0;
   var chassisNum = chassisNumStart || 1;
@@ -2095,7 +2095,11 @@ function buildPayload(ss, ctrl, inv) {
     company_seal_no:       '',
     shipping_line_seal_no: '',
     marks_and_numbers:     String(ctrl.getRange('C16').getValue() || ''),
-    scomet_product_desc:   items.length > 0 ? (items[0].description_scomet || '') : '',
+    // Joins every model group's description (not just the first) so a
+    // multi-model shipment lists all products, comma-separated, in the
+    // SCOMET declaration letter — matches the Python-side fallback in
+    // document_generator.py's build_context().
+    scomet_product_desc:   items.map(function(it) { return it.description_scomet || ''; }).filter(Boolean).join(', '),
     amount_usd_words:      AMOUNTWORDS(cif_usd, 'USD', true),
     amount_inr_words:      AMOUNTWORDS(total_inr, 'INR', true),
 

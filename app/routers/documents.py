@@ -12,7 +12,7 @@ BASE_DOWNLOAD_URL = os.getenv('BASE_DOWNLOAD_URL', 'http://localhost:8080/output
 
 DOCUMENT_MAP = {
     "proforma_invoice": "PI FORMAT.docx",
-    "commercial_invoice": "Commercial_Invoice.docx",
+    "commercial_invoice": "new_commercial_invoice1.docx",
     "packing_list": "Packing_List.docx",
     "annexure_1": "Annexure_1.docx",
     "tax_invoice": "Tax_Invoice.docx",

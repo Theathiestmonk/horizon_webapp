@@ -17,6 +17,7 @@ BASE_DOWNLOAD_URL = os.getenv("BASE_DOWNLOAD_URL", "http://localhost:8080/output
 TEMPLATE_DESC_FIELD = {
     "PI FORMAT.docx":              "description_pi",
     "Commercial_Invoice.docx":     "description_commercial",
+    "new_commercial_invoice1.docx": "description_commercial",
     "Packing_List.docx":           "description_packing",
     "Tax_Invoice.docx":            "description_tax",
     "SCOMET_Declaration.docx":     "description_scomet",
@@ -36,6 +37,7 @@ TEMPLATE_DESC_FIELD = {
 TEMPLATE_HSN_FIELD = {
     "PI FORMAT.docx":              "hsn_code_pi",
     "Commercial_Invoice.docx":     "hsn_code_user_country",
+    "new_commercial_invoice1.docx": "hsn_code_user_country",
     "Tax_Invoice.docx":            "hsn_code_user_country",
     "Packing_List.docx":           "hsn_code_user_country",
     "SCOMET_Declaration.docx":     "hsn_code_india",
@@ -306,8 +308,14 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
         context['generation_date'] = datetime.utcnow().strftime('%d.%m.%Y')
 
     # ── scomet_product_desc fallback ────────────────────────────────────────
+    # Joins every item's description (not just the first) so multi-model
+    # shipments list all products, comma-separated, in the declaration letter.
     if not context.get('scomet_product_desc') and isinstance(context.get('items'), list) and context['items']:
-        context['scomet_product_desc'] = context['items'][0].get('description_scomet', '') or context['items'][0].get('description', '')
+        descs = [
+            (it.get('description_scomet') or it.get('description') or '')
+            for it in context['items'] if isinstance(it, dict)
+        ]
+        context['scomet_product_desc'] = ', '.join(d for d in descs if d)
 
     # ── insurance_ref_no fallback ───────────────────────────────────────────
     if not context.get('insurance_ref_no'):

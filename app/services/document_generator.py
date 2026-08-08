@@ -273,16 +273,13 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
             for i, v in enumerate(context['vehicles'])
             if isinstance(v, dict)
         ]
-        # vehicle_models_list for Annexure C (item 15 "Vehicles" section)
-        context['vehicle_models_list'] = ', '.join(
-            v.get('model', '') for v in context['vehicles']
-            if isinstance(v, dict) and v.get('model')
-        )
-        # vehicle_models_columns — same set of models, deduplicated and
-        # order-preserved, for Annexure C's column-per-model layout (item 15
-        # prints each distinct model in its own table cell instead of one
-        # comma-joined string).
-        context['vehicle_models_columns'] = list(dict.fromkeys(
+        # vehicle_models_list for Annexure C (item 15 "Vehicles" section) —
+        # script.gs resolves this per-invoice (auto-filled once from
+        # Invoice_Descriptions!L, then sticks even if hand-edited there) and
+        # sends it as annexure_c_vehicles_list; this only computes a fallback
+        # (distinct models, comma-separated) for direct-API calls that don't
+        # go through script.gs at all.
+        context['vehicle_models_list'] = context.get('annexure_c_vehicles_list') or ', '.join(dict.fromkeys(
             v.get('model', '') for v in context['vehicles']
             if isinstance(v, dict) and v.get('model')
         ))

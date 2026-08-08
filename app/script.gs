@@ -11,6 +11,8 @@ const CFG = {
   unitPriceCell:      'F26',
   containerCell:      'C37',
   containerTypeCell:  'F37',  // CONTROL F37 = container type (e.g. 40' HQ), next to container no.
+  companySealNoCell:      'C38',  // CONTROL C38 = Annexure C item 11 (Company One time Bottle seal)
+  shippingLineSealNoCell: 'F38',  // CONTROL F38 = Annexure C item 12 (Shipping Line seal no.)
   portLoadCell:       'C21',
   portDischargeCell:  'F21',
   finalDestinationCell: 'H22',
@@ -61,7 +63,7 @@ const CFG = {
   // fixed per-model property, so it moved off the Products tab onto its own
   // CONTROL cell here rather than being read via genProd[19] anymore.
   invoiceCodeCell:        'F17',
-  webhookUrl: 'https://independent-len-breed-ward.trycloudflare.com/api/v1/invoices/',
+  webhookUrl: 'https://discussing-replication-partners-defeat.trycloudflare.com/api/v1/invoices/',
 };
 
 // ── Descriptions (per-model) ────────────────────────────────────────────────
@@ -458,15 +460,33 @@ var DESC_PREVIEW_FIELDS_ = [
   'description_cha_ti', 'description_cha_pl', 'description_cha_ci'
 ];
 
+// Annexure C item 15 "Vehicles" — one column right after the read-only
+// preview block (col L). Unlike DESC_PREVIEW_FIELDS_ above, this column is
+// NOT overwritten on every generation: writeDescriptionPreview_ only fills
+// it in the FIRST time (when blank), auto-computed as the distinct vehicle
+// models assigned to the invoice, comma-separated. Once it has any text —
+// auto-filled or hand-typed — that text sticks permanently and is what
+// actually gets sent to Annexure C's point 15, so you can edit it here any
+// time and future generations will keep using your edit instead of
+// recomputing it.
+var ANX_C_VEHICLES_COL_ = DESC_PREVIEW_COL_START_ + DESC_PREVIEW_HEADERS_.length;  // col L, 1-based
+
 function ensureDescriptionPreviewHeaders_(sheet) {
   var existing = sheet.getRange(3, DESC_PREVIEW_COL_START_, 1, DESC_PREVIEW_HEADERS_.length).getValues()[0];
   var needsHeaders = existing.some(function(v) { return !String(v || '').trim(); });
-  if (!needsHeaders) return;
-  var range = sheet.getRange(3, DESC_PREVIEW_COL_START_, 1, DESC_PREVIEW_HEADERS_.length);
-  range.setValues([DESC_PREVIEW_HEADERS_]);
-  range.setFontWeight('bold').setBackground('#64748b').setFontColor('#ffffff');
-  sheet.getRange(2, DESC_PREVIEW_COL_START_).setValue(
-    'AUTO-GENERATED PREVIEW — read-only, overwritten every time documents are generated. Shows the exact text that printed, whatever its source.');
+  if (needsHeaders) {
+    var range = sheet.getRange(3, DESC_PREVIEW_COL_START_, 1, DESC_PREVIEW_HEADERS_.length);
+    range.setValues([DESC_PREVIEW_HEADERS_]);
+    range.setFontWeight('bold').setBackground('#64748b').setFontColor('#ffffff');
+    sheet.getRange(2, DESC_PREVIEW_COL_START_).setValue(
+      'AUTO-GENERATED PREVIEW — read-only, overwritten every time documents are generated. Shows the exact text that printed, whatever its source.');
+  }
+  var anxCHeaderCell = sheet.getRange(3, ANX_C_VEHICLES_COL_);
+  if (!String(anxCHeaderCell.getValue() || '').trim()) {
+    anxCHeaderCell.setValue('Generated: Anx C').setFontWeight('bold').setBackground('#0d9488').setFontColor('#ffffff');
+    sheet.getRange(2, ANX_C_VEHICLES_COL_).setValue(
+      'ANNEXURE C ITEM 15 (Vehicles) — auto-filled once with the distinct vehicle models, comma-separated. Edit this cell any time; your edit sticks and is used for point 15 on every future generation instead of being recomputed.');
+  }
 }
 
 // One invoice can have several model groups (different price/model
@@ -493,9 +513,15 @@ function joinItemsField_(items, field) {
 // whichever number is active THIS run would create a second, duplicate row
 // once the shipment moves to its other stage. So this matches (and then
 // backfills) on EITHER number, consolidating both stages into one row.
-function writeDescriptionPreview_(ss, invoiceNo, piInvoiceNo, items) {
-  if (!items || items.length === 0) return;
-  if (!invoiceNo && !piInvoiceNo) return;
+// anxCVehiclesDefault: the auto-computed distinct-model comma list to seed
+// column L with the first time this invoice's row is touched. Returns the
+// FINAL resolved value for that column — whatever's already in the cell if
+// non-blank (a prior auto-fill or a hand-edit, either way it sticks), else
+// the freshly-written default — so the caller can feed it straight into the
+// payload without duplicating this sheet-read logic.
+function writeDescriptionPreview_(ss, invoiceNo, piInvoiceNo, items, anxCVehiclesDefault) {
+  if (!items || items.length === 0) return anxCVehiclesDefault || '';
+  if (!invoiceNo && !piInvoiceNo) return anxCVehiclesDefault || '';
   var sheet = ensureInvoiceDescriptionsTab_(ss);
   ensureDescriptionPreviewHeaders_(sheet);
 
@@ -524,6 +550,16 @@ function writeDescriptionPreview_(ss, invoiceNo, piInvoiceNo, items) {
 
   var rowValues = DESC_PREVIEW_FIELDS_.map(function(f) { return joinItemsField_(items, f); });
   sheet.getRange(targetRow, DESC_PREVIEW_COL_START_, 1, rowValues.length).setValues([rowValues]);
+
+  // Col L (Annexure C vehicles) — sticky, unlike the columns above: only
+  // written when blank, and whatever ends up there (default or hand-edited)
+  // is returned as-is for use in the payload.
+  var anxCCell = sheet.getRange(targetRow, ANX_C_VEHICLES_COL_);
+  var anxCExisting = String(anxCCell.getValue() || '').trim();
+  if (anxCExisting) return anxCExisting;
+  var anxCDefault = anxCVehiclesDefault || '';
+  if (anxCDefault) anxCCell.setValue(anxCDefault);
+  return anxCDefault;
 }
 
 function setupInvoiceDescriptionsTab() {
@@ -2000,7 +2036,16 @@ function buildPayload(ss, ctrl, inv) {
     if (!previewPiInvoiceNo) previewPiInvoiceNo = String(rawMatchedRows[pmi][12] || '').trim();
     if (previewInvoiceNo && previewPiInvoiceNo) break;
   }
-  writeDescriptionPreview_(ss, previewInvoiceNo, previewPiInvoiceNo, items);
+  // Default for Annexure C item 15 (Vehicles) — distinct models actually
+  // assigned to this invoice (post C17-selection), comma-separated,
+  // order-preserved. Only ever used the FIRST time this invoice's row gets
+  // touched — see writeDescriptionPreview_'s sticky-column-L handling above.
+  var anxCModelsSeen = {};
+  var anxCVehiclesDefault = vehicles
+    .map(function(v) { return String(v.model || '').trim(); })
+    .filter(function(m) { return m && !anxCModelsSeen[m] && (anxCModelsSeen[m] = true); })
+    .join(', ');
+  var annexureCVehiclesResolved = writeDescriptionPreview_(ss, previewInvoiceNo, previewPiInvoiceNo, items, anxCVehiclesDefault);
 
   // Resolve buyer details: CONTROL C12 = smart dropdown "CONTACT — COMPANY"
   // Look up in Customers sheet (col L = smart_dropdown, B = company_name, C/D/E = address, F = country)
@@ -2102,14 +2147,18 @@ function buildPayload(ss, ctrl, inv) {
     notify_1:              '',  // Null for backend to populate; client fills manually in doc if needed
     notify_2:              '',  // Null for backend to populate; client fills manually in doc if needed
     terms_of_payment:      String(ctrl.getRange(CFG.termsOfPaymentCell || 'C23').getValue() || ''),
-    company_seal_no:       '',
-    shipping_line_seal_no: '',
+    company_seal_no:       String(ctrl.getRange(CFG.companySealNoCell).getValue() || ''),
+    shipping_line_seal_no: String(ctrl.getRange(CFG.shippingLineSealNoCell).getValue() || ''),
     marks_and_numbers:     String(ctrl.getRange('C16').getValue() || ''),
     // Joins every model group's description (not just the first) so a
     // multi-model shipment lists all products, comma-separated, in the
     // SCOMET declaration letter — matches the Python-side fallback in
     // document_generator.py's build_context().
     scomet_product_desc:   items.map(function(it) { return it.description_scomet || ''; }).filter(Boolean).join(', '),
+    // Annexure C item 15 (Vehicles) — resolved above from Invoice_Descriptions!L
+    // (auto-filled once, sticks after that). Sent as-is; document_generator.py
+    // no longer computes this itself, just prints whatever arrives here.
+    annexure_c_vehicles_list: annexureCVehiclesResolved,
     amount_usd_words:      AMOUNTWORDS(cif_usd, 'USD', true),
     amount_inr_words:      AMOUNTWORDS(total_inr, 'INR', true),
 

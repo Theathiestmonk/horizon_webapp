@@ -1179,6 +1179,22 @@ function ensureFinancialsFormulas_(ctrl) {
     '=IFERROR(SUM(D' + MULTI_ITEMS_FIRST_ROW_ + ':D' + MULTI_ITEMS_LAST_ROW_ + '),0)');
 }
 
+// CONTROL!C17's "Select Vehicles for Generation" multi-select is keyed by
+// STOCK ROW NUMBER, not chassis_no — a vehicle can be RESERVED for an
+// invoice before it ever gets a chassis number assigned (normal for
+// PROFORMA/PI-only shipments), and a chassis-keyed selection could never
+// represent or match a vehicle with a blank chassis_no. Row number always
+// exists regardless. Returns null when C17 doesn't hold an active
+// multi-select (no comma), else a lookup set of row numbers (as strings).
+function parseC17SelectedRows_(ctrl) {
+  var raw = String(ctrl.getRange(CFG.stockCell).getValue() || '').trim();
+  if (raw.indexOf(',') === -1) return null;
+  var set = {};
+  raw.split(',').map(function(s) { return s.trim(); }).filter(Boolean)
+    .forEach(function(s) { set[s] = true; });
+  return set;
+}
+
 function refreshMultiProductItemsTable_(ss, ctrl) {
   ensureFinancialsFormulas_(ctrl);
   var capacity  = MULTI_ITEMS_LAST_ROW_ - MULTI_ITEMS_FIRST_ROW_ + 1;
@@ -1192,20 +1208,26 @@ function refreshMultiProductItemsTable_(ss, ctrl) {
 
   var mode   = String(ctrl.getRange(CFG.modeCell).getValue() || '').trim();
   var invCol = (mode === 'PROFORMA') ? 12 : 7;  // col M PI Invoice No, or col H assigned_to
-  var reservedRows = stock.getRange('A4:R2000').getValues()
-    .filter(function(r) { return r[0] && String(r[6]).trim() === 'RESERVED' && sameInvoice_(r[invCol], inv); });
+  // No r[0] (chassis_no) requirement here — a vehicle can be RESERVED for
+  // this invoice before it ever gets a chassis number assigned (see
+  // showGenerationVehicleSelector's note on why row number, not chassis_no,
+  // identifies a vehicle in the C17 selection below).
+  var reservedRowPairs = [];
+  stock.getRange('A4:R2000').getValues().forEach(function(r, idx) {
+    if (String(r[6]).trim() === 'RESERVED' && sameInvoice_(r[invCol], inv)) {
+      reservedRowPairs.push({ r: r, rowNum: idx + 4 });
+    }
+  });
 
   // Same C17 multi-select filter as buildPayload() — only the checked
   // subset counts when a "Select Vehicles for Generation" selection is active.
-  var c17Raw = String(ctrl.getRange(CFG.stockCell).getValue() || '').trim();
-  var c17SelectionActive = c17Raw.indexOf(',') !== -1;
-  if (c17SelectionActive) {
-    var selectedSet = {};
-    c17Raw.split(',').map(function(s) { return s.trim().toUpperCase(); }).filter(Boolean)
-      .forEach(function(c) { selectedSet[c] = true; });
-    var filtered = reservedRows.filter(function(r) { return selectedSet[String(r[0]).trim().toUpperCase()]; });
-    if (filtered.length > 0) reservedRows = filtered;
+  var selectedRowSet = parseC17SelectedRows_(ctrl);
+  var c17SelectionActive = !!selectedRowSet;
+  if (selectedRowSet) {
+    var filteredPairs = reservedRowPairs.filter(function(p) { return selectedRowSet[String(p.rowNum)]; });
+    if (filteredPairs.length > 0) reservedRowPairs = filteredPairs;
   }
+  var reservedRows = reservedRowPairs.map(function(p) { return p.r; });
 
   // Quantity (C26) and Total Packages (C34) only follow the selection when
   // the C17 checkbox picker is actually in use — at that point assignment
@@ -1369,21 +1391,23 @@ function validate() {
   if (!container) warnings.push('⚠ Container number is empty → cell: C37 (Optional except for Annexure C)');
 
   if (stock && (mode === 'FINAL' || mode === 'PROFORMA')) {
-    let assigned = stock.getRange('A4:R2000').getValues().filter(function(r) { return rowMatchesInvoice_(r, inv); });
+    let assignedPairs = [];
+    stock.getRange('A4:R2000').getValues().forEach(function(r, idx) {
+      if (rowMatchesInvoice_(r, inv)) assignedPairs.push({ r: r, rowNum: idx + 4 });
+    });
 
     // If a C17 "Select Vehicles for Generation" subset is active, qty (C26)
     // already reflects just that subset (see refreshMultiProductItemsTable_'s
     // c17SelectionActive sync) — compare against the same subset here, not
     // every reserved vehicle, otherwise a deliberate partial-shipment
     // selection always fails validation even though it's fully consistent.
-    const stockRefRaw = String(stockRef || '').trim();
-    if (stockRefRaw.indexOf(',') !== -1) {
-      const selectedSet = {};
-      stockRefRaw.split(',').map(function(s) { return s.trim().toUpperCase(); }).filter(Boolean)
-        .forEach(function(c) { selectedSet[c] = true; });
-      const filtered = assigned.filter(function(r) { return selectedSet[String(r[0]).trim().toUpperCase()]; });
-      if (filtered.length > 0) assigned = filtered;
+    // Matched by STOCK ROW NUMBER, not chassis_no — see parseC17SelectedRows_.
+    const selectedRowSet = parseC17SelectedRows_(ctrl);
+    if (selectedRowSet) {
+      const filteredPairs = assignedPairs.filter(function(p) { return selectedRowSet[String(p.rowNum)]; });
+      if (filteredPairs.length > 0) assignedPairs = filteredPairs;
     }
+    let assigned = assignedPairs.map(function(p) { return p.r; });
 
     if (assigned.length === 0)
       errors.push('⑥ No vehicles assigned to this invoice — use sidebar or Bulk Assign');
@@ -1527,6 +1551,30 @@ function buildPackingListVehicleBlock_(baseDesc, vehicleGroup) {
   return lines.join('\n');
 }
 
+// PI FORMAT style block for one model group:
+//   <base PI description — Products tab text, model-tagged>
+//   1. <chassis1>
+//        <color1>
+//   2. <chassis2>
+//        <color2>
+//   ...
+// Only vehicles that actually have a chassis_no get a numbered line — a
+// model group with none assigned yet (e.g. still at the "target quantity"
+// stage, no real Stock rows linked) falls through unchanged, same plain
+// single-line description PI FORMAT has always shown. A group with a MIX
+// (some vehicles chassis-assigned, some not) lists only the assigned ones —
+// dynamic per-vehicle, not an all-or-nothing switch for the whole group.
+function buildPiVehicleBlock_(baseDesc, vehicleGroup) {
+  var withChassis = vehicleGroup.filter(function(v) { return String(v.chassis_no || '').trim(); });
+  if (withChassis.length === 0) return baseDesc;
+  var lines = [baseDesc];
+  withChassis.forEach(function(v, i) {
+    lines.push((i + 1) + '. ' + v.chassis_no);
+    if (v.color) lines.push('     ' + v.color);
+  });
+  return lines.join('\n');
+}
+
 // Shipment-level trailer appended once, after every model block, on the
 // Commercial Invoice only: manufacture year/type, accessories, LC/TIN/dealer
 // certificate references, proforma-conformity certification line. Every
@@ -1645,8 +1693,14 @@ function buildPayload(ss, ctrl, inv) {
       matchedRowNumbers.push(idx + 4);
     }
   });
-  let vehicles = rawMatchedRows.map(function(r) {
+  let vehicles = rawMatchedRows.map(function(r, idx) {
       return {
+        // Stock row number — identifies this vehicle for the C17 "Select
+        // Vehicles for Generation" selection (see parseC17SelectedRows_):
+        // chassis_no can be blank for a not-yet-assigned vehicle, but the
+        // row number always exists, so that's what a partial selection is
+        // keyed by instead.
+        row_number:     matchedRowNumbers[idx],
         chassis_no:     r[0] || '',
         engine_no:      r[1] || '',
         model:          r[2] || '',
@@ -1719,16 +1773,14 @@ function buildPayload(ss, ctrl, inv) {
   // C17 normally holds either nothing, or a single legacy autofill value
   // ("chassis - engine - model - color", picked just to fill F26 — never
   // filtered anything). The "Select Vehicles for Generation" sidebar writes a
-  // comma-separated chassis list instead (always with a trailing comma, even
-  // for one vehicle) — that comma is what distinguishes "explicit multi-select
-  // in effect" from the old single autofill value, so legacy sheets keep
-  // generating for every reserved vehicle exactly as before.
-  var c17Raw = String(ctrl.getRange(CFG.stockCell).getValue() || '').trim();
-  if (c17Raw.indexOf(',') !== -1) {
-    var selectedSet = {};
-    c17Raw.split(',').map(function(s) { return s.trim(); }).filter(Boolean)
-      .forEach(function(c) { selectedSet[c.toUpperCase()] = true; });
-    var filteredVehicles = vehicles.filter(function(v) { return selectedSet[String(v.chassis_no).trim().toUpperCase()]; });
+  // comma-separated list instead (always with a trailing comma, even for one
+  // vehicle) — that comma is what distinguishes "explicit multi-select in
+  // effect" from the old single autofill value, so legacy sheets keep
+  // generating for every reserved vehicle exactly as before. Keyed by STOCK
+  // ROW NUMBER, not chassis_no — see parseC17SelectedRows_.
+  var selectedRowSet = parseC17SelectedRows_(ctrl);
+  if (selectedRowSet) {
+    var filteredVehicles = vehicles.filter(function(v) { return selectedRowSet[String(v.row_number)]; });
     if (filteredVehicles.length > 0) {
       Logger.log('🎯 C17 selection active: generating for ' + filteredVehicles.length + ' of ' + vehicles.length + ' reserved vehicle(s)');
       vehicles = filteredVehicles;
@@ -1982,6 +2034,12 @@ function buildPayload(ss, ctrl, inv) {
     // reflect this invoice's actual assigned/selected vehicles, never a
     // static manual list.
     it.description_packing = buildPackingListVehicleBlock_(it.description_packing, it.vehicle_list);
+
+    // PI FORMAT: append the numbered chassis+colour breakdown only for
+    // vehicles that actually have a chassis_no assigned yet — see
+    // buildPiVehicleBlock_ note above. Falls through unchanged (plain
+    // single-line description) when nothing in the group has one.
+    it.description_pi = buildPiVehicleBlock_(it.description_pi, it.vehicle_list);
 
     // description_cha_ti / description_cha_pl only ever exist to hold ONE
     // fact: "per LC document no. X dt. Y" for THIS invoice — once CONTROL's
@@ -2981,10 +3039,16 @@ function showGenerationVehicleSelector() {
 
   const mode   = ctrl.getRange(CFG.modeCell).getValue() || 'FINAL';
   const invCol = (mode === 'PROFORMA') ? 12 : 7;  // col M PI Invoice No, or col H assigned_to
-  const reserved = stock.getRange('A4:R2000').getValues()
-    .filter(function(r) { return r[0] && sameInvoice_(r[invCol], invoice); });
+  // No r[0] (chassis_no) requirement — a vehicle can be reserved for this
+  // invoice before it ever gets a chassis number assigned (normal for
+  // PROFORMA/PI-only shipments). Row number (not chassis_no) is what
+  // identifies each vehicle in the selection below — see parseC17SelectedRows_.
+  const reservedPairs = [];
+  stock.getRange('A4:R2000').getValues().forEach(function(r, idx) {
+    if (sameInvoice_(r[invCol], invoice)) reservedPairs.push({ r: r, rowNum: idx + 4 });
+  });
 
-  if (reserved.length === 0) {
+  if (reservedPairs.length === 0) {
     ui.alert('📋 No Vehicles Assigned',
       'No vehicles are currently assigned to invoice ' + invoice + ' in Stock tab "' + stock.getName() + '".\n\n' +
       'If the vehicles are actually on a different monthly Stock tab, check CONTROL!' + CFG.stockTabCell +
@@ -2994,22 +3058,18 @@ function showGenerationVehicleSelector() {
     return;
   }
 
-  // Existing C17 selection (comma list) pre-checks those chassis; otherwise
-  // every reserved vehicle starts checked — matches today's "include all" default.
-  const c17Raw = String(ctrl.getRange(CFG.stockCell).getValue() || '').trim();
-  const existingSelection = {};
-  if (c17Raw.indexOf(',') !== -1) {
-    c17Raw.split(',').map(function(s) { return s.trim().toUpperCase(); }).filter(Boolean)
-      .forEach(function(c) { existingSelection[c] = true; });
-  }
-  const hasExistingSelection = Object.keys(existingSelection).length > 0;
+  // Existing C17 selection pre-checks those rows; otherwise every reserved
+  // vehicle starts checked — matches today's "include all" default.
+  const existingSelection = parseC17SelectedRows_(ctrl);
+  const hasExistingSelection = !!existingSelection;
 
-  const rows = reserved.map(function(r) {
-    const chassis = String(r[0]);
-    const checked = hasExistingSelection ? !!existingSelection[chassis.toUpperCase()] : true;
-    return '<tr><td style="text-align:center"><input type="checkbox" class="vchk" data-chassis="' + chassis + '" ' + (checked ? 'checked' : '') + '></td>' +
-      '<td style="font-family:monospace;font-size:11px">' + chassis + '</td>' +
-      '<td>' + (r[2] || '') + '</td><td>' + (r[3] || '') + '</td></tr>';
+  const rows = reservedPairs.map(function(p) {
+    const chassis = String(p.r[0] || '').trim();
+    const chassisDisplay = chassis || '<span style="color:#94a3b8;font-style:italic">(no chassis assigned)</span>';
+    const checked = hasExistingSelection ? !!existingSelection[String(p.rowNum)] : true;
+    return '<tr><td style="text-align:center"><input type="checkbox" class="vchk" data-row="' + p.rowNum + '" ' + (checked ? 'checked' : '') + '></td>' +
+      '<td style="font-family:monospace;font-size:11px">' + chassisDisplay + '</td>' +
+      '<td>' + (p.r[2] || '') + '</td><td>' + (p.r[3] || '') + '</td></tr>';
   }).join('');
 
   const html = HtmlService.createHtmlOutput(
@@ -3030,7 +3090,7 @@ function showGenerationVehicleSelector() {
     '#msg.success{background:#dcfce7;color:#15803d;display:block}#msg.error{background:#fee2e2;color:#dc2626;display:block}' +
     '</style>' +
     '<div class="header"><h3>🎯 Select Vehicles for Generation</h3>' +
-    '<p>Invoice: <strong>' + invoice + '</strong> &nbsp;·&nbsp; ' + reserved.length + ' vehicle(s) reserved</p></div>' +
+    '<p>Invoice: <strong>' + invoice + '</strong> &nbsp;·&nbsp; ' + reservedPairs.length + ' vehicle(s) reserved</p></div>' +
     '<table><thead><tr><th>✓</th><th>Chassis No.</th><th>Model</th><th>Colour</th></tr></thead>' +
     '<tbody>' + rows + '</tbody></table>' +
     '<button class="btn" id="saveBtn" onclick="save()">Apply Selection to C17</button>' +
@@ -3038,7 +3098,7 @@ function showGenerationVehicleSelector() {
     '<div id="msg"></div>' +
     '<script>' +
     'function save(){' +
-    'var sel=[].slice.call(document.querySelectorAll(".vchk:checked")).map(function(c){return c.dataset.chassis;});' +
+    'var sel=[].slice.call(document.querySelectorAll(".vchk:checked")).map(function(c){return c.dataset.row;});' +
     'if(sel.length===0){document.getElementById("msg").textContent="❌ Select at least one vehicle.";document.getElementById("msg").className="error";return;}' +
     'var btn=document.getElementById("saveBtn"),msg=document.getElementById("msg");' +
     'btn.disabled=true;btn.textContent="Saving…";msg.className="";msg.style.display="none";' +
@@ -3057,17 +3117,19 @@ function showGenerationVehicleSelector() {
   ui.showModalDialog(html, 'Select Vehicles for Generation — ' + invoice);
 }
 
-// Writes the chosen chassis list into C17 with a trailing comma — see the
-// C17 filter note in buildPayload() for why the trailing comma matters even
-// when only one chassis is selected.
-function applyGenerationVehicleSelection(chassisList, invoiceNo) {
+// Writes the chosen STOCK ROW NUMBERS into C17 with a trailing comma — see
+// parseC17SelectedRows_ for why row number (not chassis_no) identifies each
+// vehicle, and the trailing comma matters even for a single selection since
+// that's what distinguishes an active multi-select from the legacy
+// single-value chassis autofill C17 also holds.
+function applyGenerationVehicleSelection(rowNumbers, invoiceNo) {
   const ss   = SpreadsheetApp.getActiveSpreadsheet();
   const ctrl = ss.getSheetByName('CONTROL');
-  if (!chassisList || chassisList.length === 0) throw new Error('No vehicles selected.');
-  ctrl.getRange(CFG.stockCell).setValue(chassisList.join(',') + ',');
+  if (!rowNumbers || rowNumbers.length === 0) throw new Error('No vehicles selected.');
+  ctrl.getRange(CFG.stockCell).setValue(rowNumbers.join(',') + ',');
   refreshMultiProductItemsTable_(ss, ctrl);
-  logAudit(invoiceNo, 'GENERATION_SELECTION_SET', chassisList.length + ' of reserved vehicle(s) selected: ' + chassisList.join(', '));
-  return chassisList.length + ' vehicle(s) selected — generation will use only these.';
+  logAudit(invoiceNo, 'GENERATION_SELECTION_SET', rowNumbers.length + ' of reserved vehicle(s) selected (rows: ' + rowNumbers.join(', ') + ')');
+  return rowNumbers.length + ' vehicle(s) selected — generation will use only these.';
 }
 
 // Clears C17 back to blank — buildPayload() then falls back to including

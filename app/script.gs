@@ -60,7 +60,7 @@ const CFG = {
   // fixed per-model property, so it moved off the Products tab onto its own
   // CONTROL cell here rather than being read via genProd[19] anymore.
   invoiceCodeCell:        'F17',
-  webhookUrl: 'https://rocks-antenna-harris-surfing.trycloudflare.com/api/v1/invoices/',
+  webhookUrl: 'https://washington-nov-foam-november.trycloudflare.com/api/v1/invoices/',
 };
 
 // ── Descriptions (per-model) ────────────────────────────────────────────────
@@ -729,25 +729,31 @@ function migrateStockColumnsToNewLayout() {
 // buildPayload() below, since every docx template already has its own
 // static "AMOUNT CHARGEABLE..." label before the {{ amount_*_words }} placeholder
 // — using the full sentence there duplicated "AMOUNT CHARGEABLE IN" twice.
+// Title Case throughout (matches document_generator.py's convert_to_words()
+// Python-side fallback style) — was previously ALL CAPS, which read
+// inconsistently against documents falling back to the Python path.
+// Currency labels ("US Dollar"/"INR Rupees") are literal strings, not run
+// through a generic title-case pass, so "US"/"INR" never get mangled into
+// "Us"/"Inr".
 function AMOUNTWORDS(n, curr, wordsOnly) {
   curr = curr || 'USD';
   if (!n || n === 0) return '';
-  const ones = ['','ONE','TWO','THREE','FOUR','FIVE','SIX','SEVEN','EIGHT','NINE','TEN',
-    'ELEVEN','TWELVE','THIRTEEN','FOURTEEN','FIFTEEN','SIXTEEN','SEVENTEEN','EIGHTEEN','NINETEEN'];
-  const tens = ['','','TWENTY','THIRTY','FORTY','FIFTY','SIXTY','SEVENTY','EIGHTY','NINETY'];
+  const ones = ['','One','Two','Three','Four','Five','Six','Seven','Eight','Nine','Ten',
+    'Eleven','Twelve','Thirteen','Fourteen','Fifteen','Sixteen','Seventeen','Eighteen','Nineteen'];
+  const tens = ['','','Twenty','Thirty','Forty','Fifty','Sixty','Seventy','Eighty','Ninety'];
   function words(x) {
     if (x < 20)       return ones[x] || '';
     if (x < 100)      return tens[Math.floor(x/10)] + (x%10 ? ' '+ones[x%10] : '');
-    if (x < 1000)     return ones[Math.floor(x/100)] + ' HUNDRED' + (x%100 ? ' AND '+words(x%100) : '');
-    if (x < 100000)   return words(Math.floor(x/1000)) + ' THOUSAND' + (x%1000 ? ' '+words(x%1000) : '');
-    if (x < 10000000) return words(Math.floor(x/100000)) + ' LAKH' + (x%100000 ? ' '+words(x%100000) : '');
-    return words(Math.floor(x/10000000)) + ' CRORE' + (x%10000000 ? ' '+words(x%10000000) : '');
+    if (x < 1000)     return ones[Math.floor(x/100)] + ' Hundred' + (x%100 ? ' And '+words(x%100) : '');
+    if (x < 100000)   return words(Math.floor(x/1000)) + ' Thousand' + (x%1000 ? ' '+words(x%1000) : '');
+    if (x < 10000000) return words(Math.floor(x/100000)) + ' Lakh' + (x%100000 ? ' '+words(x%100000) : '');
+    return words(Math.floor(x/10000000)) + ' Crore' + (x%10000000 ? ' '+words(x%10000000) : '');
   }
   const whole = Math.floor(Math.abs(n));
   const cents = Math.round((Math.abs(n) - whole) * 100);
   const currText = curr === 'INR' ? 'INR Rupees' : 'US Dollar';
-  let result = (wordsOnly ? '' : 'AMOUNT CHARGEABLE IN ') + currText + ' ' + words(whole) + ' ONLY';
-  if (cents > 0) result += ' AND PAISE ' + words(cents) + ' ONLY';
+  let result = (wordsOnly ? '' : 'Amount Chargeable In ') + currText + ' ' + words(whole) + ' Only';
+  if (cents > 0) result += ' And Paise ' + words(cents) + ' Only';
   return result;
 }
 

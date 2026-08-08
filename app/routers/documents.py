@@ -16,7 +16,7 @@ DOCUMENT_MAP = {
     "packing_list": "Packing_List.docx",
     "annexure_1": "Annexure_1.docx",
     "tax_invoice": "Tax_Invoice.docx",
-    "annexure_c": "Annexure_C.docx",
+    "annexure_c": "ANX C.docx",
     "scomet": "SCOMET_Declaration.docx",
     "dbk": "DBK_Declaration.docx",
     "vintage": "Vintage_Car_Declaration.docx",

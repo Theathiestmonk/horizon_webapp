@@ -22,6 +22,7 @@ TEMPLATE_DESC_FIELD = {
     "Tax_Invoice.docx":            "description_tax",
     "SCOMET_Declaration.docx":     "description_scomet",
     "Annexure_C.docx":             "description_scomet",
+    "ANX C.docx":                  "description_scomet",
     "Annexure_1.docx":             "description_annexure1",
     "CHA TI.docx":                 "description_cha_ti",
     "CHA PL.docx":                 "description_cha_pl",
@@ -42,6 +43,7 @@ TEMPLATE_HSN_FIELD = {
     "Packing_List.docx":           "hsn_code_user_country",
     "SCOMET_Declaration.docx":     "hsn_code_india",
     "Annexure_C.docx":             "hsn_code_india",
+    "ANX C.docx":                  "hsn_code_india",
     "Annexure_1.docx":             "hsn_code_india",
     "DBK_Declaration.docx":        "hsn_code_india",
     "Vintage_Car_Declaration.docx":"hsn_code_india",
@@ -275,6 +277,14 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
             v.get('model', '') for v in context['vehicles']
             if isinstance(v, dict) and v.get('model')
         )
+        # vehicle_models_columns — same set of models, deduplicated and
+        # order-preserved, for Annexure C's column-per-model layout (item 15
+        # prints each distinct model in its own table cell instead of one
+        # comma-joined string).
+        context['vehicle_models_columns'] = list(dict.fromkeys(
+            v.get('model', '') for v in context['vehicles']
+            if isinstance(v, dict) and v.get('model')
+        ))
 
     # ── notify_1 fallback → buyer name + address for Annexure C consignee ──
     if not context.get('notify_1'):
@@ -320,6 +330,13 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
     # ── insurance_ref_no fallback ───────────────────────────────────────────
     if not context.get('insurance_ref_no'):
         context['insurance_ref_no'] = context.get('lc_number', '')
+
+    # ── container_type fallback (Annexure C item 14) ────────────────────────
+    # No CONTROL cell/payload field feeds this yet — defaults to the value
+    # every shipment used before this became a variable, so nothing changes
+    # until a real container_type is wired in from script.gs.
+    if not context.get('container_type'):
+        context['container_type'] = "40' HQ"
 
     # ── Amount in words ─────────────────────────────────────────────────────
     if not context.get('amount_usd_words'):

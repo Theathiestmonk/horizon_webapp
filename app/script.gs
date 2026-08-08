@@ -925,6 +925,7 @@ function onOpen() {
     .addItem('📦 Export CHA Package',        'exportCHAPackage')
     .addSeparator()
     .addItem('🚢 Set Port Dropdowns',         'setupPortDropdowns')
+    .addItem('🔄 Refresh Lookup Dropdowns (Country/Port/Container Type/etc.)', 'refreshLookupDropdownsNow')
     .addItem('👁 Assigned Vehicles Panel',    'showAssignedVehiclesPanel')
     .addItem('📊 Legacy Ship-Date Report Tabs (SR_, read-only)', 'buildMonthlyStockTabs')
     .addItem('✏️ Edit Exporter / Bank',        'showExporterBankEditor')
@@ -947,6 +948,7 @@ function onOpen() {
   ensureStockExtraColumnsAllTabs_(ss);
   ensureProductsExtraColumns_(ss);
   ensureCustomerSmartDropdownColumn_(ss);
+  ensureLookupDropdowns_(ss);
   refreshDashboard_(ss);
 }
 
@@ -3054,6 +3056,69 @@ function setupPortDropdowns() {
     'Port of Discharge (F21) and Final Destination (H22) now have dropdown lists.\n\n' +
     'You can still type any custom value — the dropdown is a suggestion, not a lock.',
     ui.ButtonSet.OK);
+}
+
+// ── Lookups-tab dropdowns (CONTROL) ─────────────────────────────────────────
+// setupPortDropdowns() above snapshots a hardcoded list into F21/H22 — every
+// other CONTROL dropdown that's meant to pull from the "Lookups" tab
+// (Countries / Ports / Container Types / Payment Terms / ICST Rates /
+// Transport Modes) was previously set up as a plain Sheets Data Validation
+// "list from a range" pointing at a FIXED range on Lookups (e.g. C2:C10) —
+// so typing a new value into row 11 never showed up, since the validation
+// range itself never grew. requireValueInRange (not requireValueInList) is
+// the fix: it's a LIVE reference to the range, not a snapshot, so any value
+// typed anywhere inside that range appears in the dropdown immediately with
+// no script re-run needed — this function just needs to point every mapped
+// CONTROL cell at a generously-sized range once (rows 2-1000) per Lookups
+// column, and re-assert it on every open in case a validation ever gets
+// cleared by hand.
+//
+// Column letters are discovered by header name (row 1) rather than
+// hardcoded positions — same defensive reasoning as the Stock column
+// migrations elsewhere in this file: if the Lookups tab's columns ever get
+// reordered, this keeps working without needing an update here too.
+var LOOKUP_DROPDOWN_MAP_ = [
+  { header: 'Countries',      cells: ['F23', 'H22'] },  // Country of Origin, Country of Final Destination / buyer country
+  { header: 'Ports',          cells: ['C21', 'F21'] },  // Port of Loading, Port of Discharge
+  { header: 'Container Types',cells: ['F37'] },          // Type of Container (Annexure C item 14)
+  { header: 'Payment Terms',  cells: ['C23'] },
+  { header: 'ICST Rates',     cells: ['F29'] },
+  { header: 'Transport Modes',cells: ['F22'] }
+];
+var LOOKUP_DROPDOWN_LAST_ROW_ = 1000;
+
+function ensureLookupDropdowns_(ss) {
+  var lookups = ss.getSheetByName('Lookups');
+  var ctrl    = ss.getSheetByName('CONTROL');
+  if (!lookups || !ctrl) return;
+
+  var lastCol = Math.max(lookups.getLastColumn(), 1);
+  var headers = lookups.getRange(1, 1, 1, lastCol).getValues()[0]
+    .map(function(h) { return String(h || '').trim(); });
+
+  LOOKUP_DROPDOWN_MAP_.forEach(function(entry) {
+    var colIndex = headers.indexOf(entry.header) + 1;  // 1-based; 0 means not found
+    if (colIndex === 0) return;  // header renamed/removed on Lookups — skip rather than guess
+    var range = lookups.getRange(2, colIndex, LOOKUP_DROPDOWN_LAST_ROW_ - 1, 1);
+    var rule = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(range, true)
+      .setAllowInvalid(true)
+      .setHelpText('Pick from Lookups!' + entry.header + ', or type a custom value')
+      .build();
+    entry.cells.forEach(function(cellA1) { ctrl.getRange(cellA1).setDataValidation(rule); });
+  });
+}
+
+// Manual menu action — re-applies immediately without needing to reopen the
+// spreadsheet (onOpen already calls ensureLookupDropdowns_ on every open).
+function refreshLookupDropdownsNow() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureLookupDropdowns_(ss);
+  SpreadsheetApp.getUi().alert('✅ Lookup Dropdowns Refreshed',
+    'Country / Port / Container Type / Payment Terms / ICST Rate / Transport Mode dropdowns on CONTROL now ' +
+    'reference Lookups rows 2-' + LOOKUP_DROPDOWN_LAST_ROW_ + ' directly — any value you add to the Lookups tab ' +
+    'within that range will show up immediately, with no need to run this again.',
+    SpreadsheetApp.getUi().ButtonSet.OK);
 }
 
 function showAssignedVehiclesPanel() {

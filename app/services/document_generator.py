@@ -158,6 +158,7 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
     if isinstance(context.get('shipping'), dict):
         shipping = context.get('shipping', {})
         context['container_no']           = shipping.get('container_no', '')
+        context['container_type']         = shipping.get('container_type', '')
         context['pre_carriage_by']        = shipping.get('pre_carriage_by', '')
         context['mode_of_transport']      = shipping.get('mode_of_transport', '')
         context['country_of_origin']      = shipping.get('country_of_origin', 'INDIA')
@@ -332,9 +333,8 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
         context['insurance_ref_no'] = context.get('lc_number', '')
 
     # ── container_type fallback (Annexure C item 14) ────────────────────────
-    # No CONTROL cell/payload field feeds this yet — defaults to the value
-    # every shipment used before this became a variable, so nothing changes
-    # until a real container_type is wired in from script.gs.
+    # Fed from CONTROL!F37 via script.gs shipping.container_type. Falls back
+    # to the old hardcoded value when that cell is left blank.
     if not context.get('container_type'):
         context['container_type'] = "40' HQ"
 

@@ -10,6 +10,7 @@ const CFG = {
   qtyCell:            'C26',
   unitPriceCell:      'F26',
   containerCell:      'C37',
+  containerTypeCell:  'F37',  // CONTROL F37 = container type (e.g. 40' HQ), next to container no.
   portLoadCell:       'C21',
   portDischargeCell:  'F21',
   finalDestinationCell: 'H22',
@@ -60,7 +61,7 @@ const CFG = {
   // fixed per-model property, so it moved off the Products tab onto its own
   // CONTROL cell here rather than being read via genProd[19] anymore.
   invoiceCodeCell:        'F17',
-  webhookUrl: 'https://washington-nov-foam-november.trycloudflare.com/api/v1/invoices/',
+  webhookUrl: 'https://independent-len-breed-ward.trycloudflare.com/api/v1/invoices/',
 };
 
 // ── Descriptions (per-model) ────────────────────────────────────────────────
@@ -2060,7 +2061,8 @@ function buildPayload(ss, ctrl, inv) {
       port_of_loading:        ctrl.getRange(CFG.portLoadCell).getValue() || '',
       port_of_discharge:      ctrl.getRange(CFG.portDischargeCell).getValue() || '',
       final_destination:      ctrl.getRange(CFG.finalDestinationCell).getValue() || '',
-      container_no:           ctrl.getRange(CFG.containerCell).getValue() || ''
+      container_no:           ctrl.getRange(CFG.containerCell).getValue() || '',
+      container_type:         ctrl.getRange(CFG.containerTypeCell).getValue() || ''
     },
 
     financials: {

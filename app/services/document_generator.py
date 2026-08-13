@@ -79,28 +79,37 @@ _RATE_KEYS_TOP = (
 def _clean_rate(v):
     return int(v) if isinstance(v, float) and v == int(v) else v
 
+def _format_money(v):
+    """Whole-number USD/INR amount as a thousands-comma string (1850 -> '1,850').
+    Non-numeric values (already a string, None, etc.) pass through unchanged."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return f"{round(v):,}"
+    return v
+
 def _round_money(context: Dict[str, Any]) -> None:
     for key in _MONEY_KEYS_TOP:
-        if isinstance(context.get(key), float):
-            context[key] = int(round(context[key]))
+        if key in context:
+            context[key] = _format_money(context[key])
     for key in _RATE_KEYS_TOP:
         if key in context:
             context[key] = _clean_rate(context[key])
     for it in (context.get('items') or []):
         if isinstance(it, dict):
             for key in _MONEY_KEYS_ITEM:
-                if isinstance(it.get(key), float):
-                    it[key] = int(round(it[key]))
+                if key in it:
+                    it[key] = _format_money(it[key])
     item_singular = context.get('item')
     if isinstance(item_singular, dict):
         for key in _MONEY_KEYS_ITEM:
-            if isinstance(item_singular.get(key), float):
-                item_singular[key] = int(round(item_singular[key]))
+            if key in item_singular:
+                item_singular[key] = _format_money(item_singular[key])
     for v in (context.get('vehicles') or []):
         if isinstance(v, dict):
             for key in _MONEY_KEYS_VEHICLE:
-                if isinstance(v.get(key), float):
-                    v[key] = int(round(v[key]))
+                if key in v:
+                    v[key] = _format_money(v[key])
 
 def convert_to_words(amount: float, currency: str = "INR") -> str:
     try:

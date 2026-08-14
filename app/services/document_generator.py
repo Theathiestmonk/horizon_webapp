@@ -154,6 +154,18 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
             'total_inr':         financials.get('total_value_inr', 0),
         })
 
+    # ── Freight/insurance boolean flags ─────────────────────────────────────
+    # Computed here (numeric, pre-formatting) rather than letting templates
+    # test freight_usd/insurance_usd directly — _round_money() below turns
+    # those into thousands-comma STRINGS (e.g. 0 -> "0"), and a non-empty
+    # string is truthy in Jinja even when its value is "0". A template-side
+    # `{% if freight_usd %}` would therefore always be true. These two flags
+    # stay real booleans all the way to render, so CHA CI's freight/insurance
+    # rows and the CI/CHA TI "CIF vs FOB" label can safely branch on them.
+    context['has_freight']              = bool(context.get('freight_usd'))
+    context['has_insurance']            = bool(context.get('insurance_usd'))
+    context['has_freight_or_insurance'] = context['has_freight'] or context['has_insurance']
+
     # ── Flatten weights ─────────────────────────────────────────────────────
     if isinstance(context.get('weights'), dict):
         weights = context.get('weights', {})

@@ -15,7 +15,12 @@ const CFG = {
   shippingLineSealNoCell: 'F38',  // CONTROL F38 = Annexure C item 12 (Shipping Line seal no.)
   portLoadCell:       'C21',
   portDischargeCell:  'F21',
-  finalDestinationCell: 'H22',
+  // Deliberately its OWN cell, distinct from buyerCountryCell (H22) — CHA CI
+  // prints both "COUNTRY OF FINAL DESTINATION" (the country, H22) and
+  // "FINAL DESTINATION" (a city/port, C22) as two separate fields, but they
+  // used to both read H22 and so always printed identically. C22 was blank/
+  // unused before this.
+  finalDestinationCell: 'C22',
   modeCell:           'F3',
   exchangeRateCell:   'C29',
   igstRateCell:       'F29',
@@ -63,8 +68,18 @@ const CFG = {
   // fixed per-model property, so it moved off the Products tab onto its own
   // CONTROL cell here rather than being read via genProd[19] anymore.
   invoiceCodeCell:        'F17',
-  webhookUrl: 'https://discussing-replication-partners-defeat.trycloudflare.com/api/v1/invoices/',
+  webhookUrl: 'https://engagement-dramatically-peas-defines.trycloudflare.com/api/v1/invoices/',
 };
+
+// A stray leading/trailing space pasted alongside a new Cloudflare tunnel
+// URL (easy to do — copy-pasting from a terminal or chat often carries one)
+// makes UrlFetchApp.fetch throw "Invalid argument: %20https://..." since the
+// leading space gets URL-encoded into the request. Every generate*()
+// function below should read the webhook base through this instead of
+// CFG.webhookUrl directly, so a stray space next time doesn't break generation.
+function webhookBase_() {
+  return String(CFG.webhookUrl || '').trim();
+}
 
 // ── Descriptions (per-model) ────────────────────────────────────────────────
 // Used to live in a separate 'Descriptions' tab that duplicated Products'
@@ -184,6 +199,7 @@ function ensureCustomsFieldsLabels_(ss) {
     if (!String(cell.getValue()).trim()) cell.setValue(text);
   }
   setIfBlank('E24', 'LC Date');
+  setIfBlank('B22', 'Final Destination (City/Port) — CHA CI only');
   setIfBlank('A56', '  ⑩  CUSTOMS / DESTINATION COMPLIANCE  (optional — used by Commercial Invoice / CHA CI, TI generation)');
   setIfBlank('B57', 'TIN No.');
   setIfBlank('E57', 'Vehicle Type');
@@ -1072,7 +1088,11 @@ function onSelectionChange(e) {
 
 // Called when C12 (customer dropdown) is changed in CONTROL.
 // Looks up the selected value in Customers col L (smart_dropdown) and fills:
-//   C13 = full address  |  C14 = notify party  |  H22 = country
+//   C13 = full address  |  H22 = country
+// C14 (Notify 1) is deliberately NOT auto-filled here anymore — it's a
+// manually-typed field now (see CFG.notifyCell1), used verbatim as-is for
+// Annexure C point 9(c) and every CHA document's "NOTIFY 1" line, instead of
+// falling back to the full buyer name/address/country blob.
 function autoFillCustomerDetails_(ctrl, ss, dropdownVal) {
   if (!dropdownVal) return;
   var custSheet = ss.getSheetByName('Customers');
@@ -1096,12 +1116,8 @@ function autoFillCustomerDetails_(ctrl, ss, dropdownVal) {
     // Full address block for C13
     var fullAddr = [addr1, addr2, city].filter(Boolean).join(', ');
 
-    // Notify party: company name (or contact + company if both present)
-    var notifyParty = companyName || contactName;
-
     ctrl.getRange('C12').setValue(companyName || dropdownVal);  // display company name
     if (fullAddr)    ctrl.getRange('C13').setValue(fullAddr);
-    if (notifyParty) ctrl.getRange('C14').setValue(notifyParty);
     if (country)     ctrl.getRange('H22').setValue(country);
 
     Logger.log('✅ Customer autofill: "' + companyName + '" | addr="' + fullAddr + '" | country="' + country + '"');
@@ -1492,61 +1508,49 @@ function formatDdMmYyyy_(v) {
   return String(v).trim();
 }
 
-// Commercial Invoice style block for one model group:
+// Commercial Invoice style block for one model group — deliberately bare:
 //   MODEL CC
-//   I.  CHASSIS NO:
-//     1.<chassis1>
-//        NO OF THE EXPORT INSPECTION CERTIFICATE: <cert1>
-//        YEAR/MONTH OF THE FIRST REGISTRATION: <reg1>
-//     2.<chassis2>                              <- label NOT repeated
-//   II.  MAKE:   <make>
-//   III. MODEL:  <model>
-// "I. CHASSIS NO:" appears once per model group, not once per vehicle. The
-// Roman-numeral labels (I/II/III) RESET at the start of every model group —
-// each model is its own self-contained numbered block — but the Arabic
-// chassis numbers (1/2/3...) run globally across the WHOLE invoice, picked
-// up via chassisNumStart/returned as nextChassisNum so the next model
-// continues counting instead of restarting at 1. EIC-certificate /
-// registration lines are omitted per-vehicle if that vehicle's cell is
-// blank, so partially-filled data doesn't print empty labels.
+//   1.<chassis1>
+//      NO OF THE EXPORT INSPECTION CERTIFICATE: <cert1>
+//      YEAR/MONTH OF THE FIRST REGISTRATION: <reg1>
+//   2.<chassis2>
+// No "CHASSIS NO:"/"MAKE:"/"MODEL:" outline labels anymore (dropped per
+// user request for a simpler block) — just the model line followed by the
+// numbered chassis list. Chassis numbers (1/2/3...) still run globally
+// across the WHOLE invoice via chassisNumStart/nextChassisNum, so a second
+// model group continues counting instead of restarting at 1. EIC-certificate/
+// registration lines are still printed per-vehicle when present (nothing in
+// this simplified format needed them removed, they just don't show up when
+// blank, same as before). nextRomanIdx is always 0 now since this block no
+// longer prints any Roman-numeral lines itself — buildCommercialInvoiceTrailer_
+// numbering (YEAR OF MANUFACTURE, LC NO., etc.) always starts fresh at "I."
 function buildVehicleDetailBlock_(modelDisplay, engineCc, hsCodeDotted, make, vehicleGroup, chassisNumStart) {
   var lines = [];
   var ccPart = engineCc ? (String(engineCc).trim() + ' ') : '';
   lines.push((modelDisplay + ' ' + ccPart).trim());
 
-  var romanIdx = 0;
   var chassisNum = chassisNumStart || 1;
-
-  romanIdx++;
-  lines.push(toRoman_(romanIdx) + '.  CHASSIS NO: ');
   vehicleGroup.forEach(function(v) {
     lines.push(chassisNum + '.' + (v.chassis_no || ''));
     chassisNum++;
     if (v.eic_cert_no) lines.push('   NO OF THE EXPORT INSPECTION CERTIFICATE: ' + v.eic_cert_no);
     if (v.first_registration_date) lines.push('   YEAR/MONTH OF THE FIRST REGISTRATION: ' + v.first_registration_date);
   });
-  if (make) {
-    romanIdx++;
-    lines.push(toRoman_(romanIdx) + '.  MAKE:   ' + make);
-  }
-  romanIdx++;
-  lines.push(toRoman_(romanIdx) + '. MODEL:  ' + modelDisplay);
 
-  return { text: lines.join('\n'), nextChassisNum: chassisNum, nextRomanIdx: romanIdx };
+  return { text: lines.join('\n'), nextChassisNum: chassisNum, nextRomanIdx: 0 };
 }
 
-// Packing List style block for one model group:
-//   <base packing description — Products/Descriptions-tab text, model-tagged>
-//   VIN 1: <chassis1> ENG. No. <engine1> Colour: <color1>
-//   VIN 2: <chassis2> ENG. No. <engine2> Colour: <color2>
-//   ...
-// One "VIN n:" line per vehicle actually in this model group — vehicleGroup
-// is already the post-C17-selection subset, so this reflects only the
-// vehicles the user picked for this generation run, not every reserved one.
-function buildPackingListVehicleBlock_(baseDesc, vehicleGroup) {
-  var lines = [baseDesc];
+// Packing List style block for one model group — same bare shape as the
+// Commercial Invoice block above (model line + numbered chassis list), with
+// each vehicle's colour appended on its own line instead of a "VIN n: ...
+// ENG. No. ... Colour: ..." label line. Chassis numbering here is local to
+// this model group (1, 2, 3...), not the CI block's global counter — nothing
+// requires it to stay in sync across model groups.
+function buildPackingListVehicleBlock_(modelDisplay, engineCc, vehicleGroup) {
+  var ccPart = engineCc ? (String(engineCc).trim() + ' ') : '';
+  var lines = [(modelDisplay + ' ' + ccPart).trim()];
   vehicleGroup.forEach(function(v, i) {
-    lines.push('VIN ' + (i + 1) + ': ' + (v.chassis_no || '') + ' ENG. No. ' + (v.engine_no || '') + ' Colour: ' + (v.color || ''));
+    lines.push((i + 1) + '.' + (v.chassis_no || '') + ' ' + (v.color || ''));
   });
   return lines.join('\n');
 }
@@ -1577,19 +1581,17 @@ function buildPiVehicleBlock_(baseDesc, vehicleGroup) {
 
 // Shipment-level trailer appended once, after every model block, on the
 // Commercial Invoice only: manufacture year/type, accessories, LC/TIN/dealer
-// certificate references, proforma-conformity certification line. Every
-// piece is optional — a blank CONTROL cell just omits that line rather than
-// printing "LC NO.  DT. ". Roman-numeral labels continue from
-// startRomanIdx (the last model block's ending index — e.g. if the last
-// model ended at "III. MODEL", this trailer's first labeled line is "IV."),
-// so the whole description reads as one continuous outline instead of
-// restarting the numbering after the vehicle blocks.
-// piInvoiceNo/piInvoiceDate MUST be the ORIGINAL Proforma invoice's number
-// and date (resolved from Stock's pi_invoice_no/pi_invoice_date columns in
-// buildPayload) — this line is certifying the FINAL shipment against that
-// earlier PI, so it can never cite whichever invoice is being generated
-// right now (that was the bug: it used to print the current invoice's own
-// number/date here, which is meaningless when generating the FINAL invoice).
+// certificate references. Every piece is optional — a blank CONTROL cell
+// just omits that line rather than printing "LC NO.  DT. ". Roman-numeral
+// labels continue from startRomanIdx (the last model block's ending index —
+// e.g. if the last model ended at "III. MODEL", this trailer's first
+// labeled line is "IV."), so the whole description reads as one continuous
+// outline instead of restarting the numbering after the vehicle blocks.
+// piInvoiceNo/piInvoiceDate are accepted but no longer printed — the
+// "CERTIFYING THAT SHIPMENT IS IN CONFORMITY WITH PROFORMA INVOICE NO. ..."
+// line was dropped per user request. Left as params rather than removed
+// from the signature/call site since buildPayload() still resolves them
+// for other potential uses.
 function buildCommercialInvoiceTrailer_(ctrl, accessories, piInvoiceNo, piInvoiceDate, countryOfOrigin, fallbackYear, startRomanIdx) {
   var lines = [];
   var romanIdx = startRomanIdx || 0;
@@ -1615,28 +1617,27 @@ function buildCommercialInvoiceTrailer_(ctrl, accessories, piInvoiceNo, piInvoic
     lines.push(toRoman_(romanIdx) + '.  DEPARTMENT OF MOTOR TRAFFIC OF ' + (countryOfOrigin === 'INDIA' ? String(countryOfOrigin) : String(countryOfOrigin || '')) +
       ' DEALER CERTIFICATE NO.' + dealerCertNo + (dealerCertDate ? (' DATED ' + dealerCertDate) : ''));
   }
-  if (piInvoiceNo) {
-    lines.push('CERTIFYING THAT SHIPMENT IS IN CONFORMITY WITH PROFORMA');
-    lines.push('INVOICE NO. ' + piInvoiceNo + (piInvoiceDate ? (' DT ' + piInvoiceDate) : ''));
-  }
   return lines.join('\n');
 }
 
-// CHA CI style block for one model group:
-//   MOTOR VEHICLES WITH HSN CODE AND CHASSIS NO AS PER LC DOCUMENT NO. x DT. y
-//   CHASSIS NO:    <chassis1>          <- label repeated per vehicle here,
-//   CHASSIS NO:    <chassis2>             unlike the plain CI block above
+// CHA CI style block for one model group — no longer keyed to the LC
+// reference/chassis list (dropped per user request):
+//   <baseDesc — Products tab column N ("CHA CI Description")>
 //   District Origin Code: <code1, code2, ...>
 //   State Origin Code: <code1, code2, ...>
+// baseDesc is NOT hardcoded — it's whatever's typed in Products!N (falls
+// back to the model's detailed packing description, then the CONTROL
+// default, same fallback chain every other per-model description already
+// uses — see fallbackDesc/descChaCi in buildPayload()).
 // District/State codes come from each vehicle's own Stock columns (V/W) if
 // filled in, else fall back to the model's single Products-tab code —
 // matches your example where two units of the same model had two different
-// origin codes ("102, 315").
-function buildChaCiVehicleBlock_(lcLine, vehicleGroup, defaultDistrict, defaultState) {
-  var lines = [lcLine];
+// origin codes ("102, 315"). Always generated regardless of whether CONTROL's
+// LC No./Date are filled in — unlike CHA TI/PL, this no longer depends on lcLine.
+function buildChaCiVehicleBlock_(baseDesc, vehicleGroup, defaultDistrict, defaultState) {
+  var lines = [baseDesc];
   var districts = [], states = [];
   vehicleGroup.forEach(function(v) {
-    lines.push('CHASSIS NO:    ' + (v.chassis_no || ''));
     districts.push(v.district_origin_code || defaultDistrict || '');
     states.push(v.state_origin_code || defaultState || '');
   });
@@ -1879,7 +1880,15 @@ function buildPayload(ss, ctrl, inv) {
     Logger.log('    desc_pack(O)="' + descPacking + '" | desc_tax(P)="' + descTax + '" | desc_ann1(R)="' + descAnnexure1 + '"');
     Logger.log('    district(G)="' + districtCode + '" | state(H)="' + stateCode + '"');
 
-    // Append product_name (col B) and model name to all descriptions
+    // Append product_name (col B) and model name to a description — only
+    // still used for SCOMET / Tax Invoice / Annexure-1 / CHA TI below. PI,
+    // Commercial Invoice, CHA CI and Packing List used to go through this
+    // too, but the Products-tab text for those already spells out the model
+    // itself (e.g. "TOYOTA URBAN CRUISER TAISOR V AT TURBO 998 CC...") —
+    // appending product_name/model again just duplicated it at the end
+    // ("...MANUFACTURING YEAR 2026 TOYOTA URBAN CRUISER TAISOR"), so those 4
+    // now print descPi/descComm/descChaCi/descPacking exactly as typed,
+    // same as description_cha_pl already does.
     var modelDisplay = v.model || modelKey;
     function withModel(base) {
       var parts = [base];
@@ -1892,16 +1901,16 @@ function buildPayload(ss, ctrl, inv) {
       itemsObj[groupKey] = {
         hsn_code:               hsnCode,
         hsn_code_pi:            hsnCodePi,
-        description:            withModel(descPi),  // default = PI FORMAT desc; backend overrides per-template
-        description_commercial: withModel(descComm),
+        description:            descPi,  // default = PI FORMAT desc; backend overrides per-template
+        description_commercial: descComm,
         description_scomet:     withModel(descScomet),
-        description_packing:    withModel(descPacking),
+        description_packing:    descPacking,
         description_tax:        withModel(descTax),
-        description_pi:         withModel(descPi),
+        description_pi:         descPi,
         description_annexure1:  withModel(descAnnexure1),
-        description_cha_ti:     withModel(descChaTi),
-        description_cha_pl:     withModel(descChaPl),
-        description_cha_ci:     withModel(descChaCi),
+        description_cha_ti:     descChaTi,  // printed exactly as typed on Products tab — no model name appended
+        description_cha_pl:     descChaPl,  // printed exactly as typed on Products tab — no model name appended
+        description_cha_ci:     descChaCi,
         quantity:               0,
         rate_per_unit:          price,
         amount_usd:             0,
@@ -2028,12 +2037,12 @@ function buildPayload(ss, ctrl, inv) {
     globalChassisNum = vehicleBlock.nextChassisNum;
     lastModelRomanIdx = vehicleBlock.nextRomanIdx;
 
-    // Packing List always gets the VIN breakdown appended — the base line
-    // (Products tab default, or a Descriptions-tab override if one exists)
-    // is kept as-is, but which VINs are listed underneath must always
-    // reflect this invoice's actual assigned/selected vehicles, never a
-    // static manual list.
-    it.description_packing = buildPackingListVehicleBlock_(it.description_packing, it.vehicle_list);
+    // Packing List description is now the same auto-generated model+chassis
+    // block as the Commercial Invoice, with each vehicle's colour appended —
+    // the Products-tab desc_packing_list column no longer feeds this field,
+    // same reasoning as description_commercial above (per-chassis facts
+    // can't live in a single static column).
+    it.description_packing = buildPackingListVehicleBlock_(it.model_display, engineCc, it.vehicle_list);
 
     // PI FORMAT: append the numbered chassis+colour breakdown only for
     // vehicles that actually have a chassis_no assigned yet — see
@@ -2041,26 +2050,27 @@ function buildPayload(ss, ctrl, inv) {
     // single-line description) when nothing in the group has one.
     it.description_pi = buildPiVehicleBlock_(it.description_pi, it.vehicle_list);
 
-    // description_cha_ti / description_cha_pl only ever exist to hold ONE
-    // fact: "per LC document no. X dt. Y" for THIS invoice — once CONTROL's
-    // LC No./Date are filled in, that live, invoice-specific fact always
-    // wins outright, regardless of whatever static text happens to sit in
-    // the Descriptions tab. Both CHA TI/CHA PL templates render one row PER
-    // MODEL GROUP (document_generator.py copies this field onto every item's
-    // own description), so it must be set on every item, not just the first —
-    // leaving it blank on items after the first (as an earlier version of
-    // this did) left every model but the first with a blank description
-    // cell in the actual generated document.
+    // description_cha_ti only ever exists to hold ONE fact: "per LC document
+    // no. X dt. Y" for THIS invoice — once CONTROL's LC No./Date are filled
+    // in, that live, invoice-specific fact always wins outright, regardless
+    // of whatever static text happens to sit in the Products tab. CHA TI
+    // renders one row PER MODEL GROUP (document_generator.py copies this
+    // field onto every item's own description), so it must be set on every
+    // item, not just the first — leaving it blank on items after the first
+    // (as an earlier version of this did) left every model but the first
+    // with a blank description cell in the actual generated document.
+    //
+    // CHA PL is deliberately NOT overridden here — its description should
+    // always print exactly what the user typed on the Products tab (CHA PL
+    // Description column), never the auto-generated LC reference line.
     if (lcLine) it.description_cha_ti = lcLine;
-    if (lcLine) it.description_cha_pl = lcLine;
 
-    // CHA CI description is ALWAYS the auto-generated per-vehicle block too,
-    // for the same reason as Commercial Invoice above — the Descriptions
-    // tab's "CHA CI Description" column no longer overrides this. Still
-    // requires an LC number/date (nothing to reference otherwise).
-    if (lcLine) {
-      it.description_cha_ci = buildChaCiVehicleBlock_(lcLine, it.vehicle_list, it.district_origin_code, it.state_origin_code);
-    }
+    // CHA CI description is ALWAYS the auto-generated per-model block now —
+    // its opening line still comes from the Products tab's "CHA CI
+    // Description" column (N), same source as before, with the
+    // district/state origin lines appended underneath. Unlike CHA TI/PL this
+    // doesn't depend on CONTROL's LC No./Date being filled in.
+    it.description_cha_ci = buildChaCiVehicleBlock_(it.description_cha_ci, it.vehicle_list, it.district_origin_code, it.state_origin_code);
 
     if (idx === items.length - 1) {
       var fallbackYear = it.vehicle_list.length ? String(it.vehicle_list[0].year || '') : '';
@@ -2068,11 +2078,9 @@ function buildPayload(ss, ctrl, inv) {
       var trailer = buildCommercialInvoiceTrailer_(ctrl, accessories, resolvedPiInvoiceNo || inv, resolvedPiInvoiceDate || invoiceDateStr, countryOfOriginVal, fallbackYear, lastModelRomanIdx);
       if (trailer) it.description_commercial += '\n' + trailer;
 
-      if (lcLine) {
-        var sqcCode       = genProd ? String(genProd[5] || '').trim() : '';
-        var chaCiTrailer = buildChaCiTrailer_(sqcCode, prefTradeCodeVal, invoiceCodeVal, countryOfOriginVal);
-        if (chaCiTrailer) it.description_cha_ci += '\n' + chaCiTrailer;
-      }
+      var sqcCode      = genProd ? String(genProd[5] || '').trim() : '';
+      var chaCiTrailer = buildChaCiTrailer_(sqcCode, prefTradeCodeVal, invoiceCodeVal, countryOfOriginVal);
+      if (chaCiTrailer) it.description_cha_ci += '\n' + chaCiTrailer;
     }
   });
 
@@ -2202,7 +2210,11 @@ function buildPayload(ss, ctrl, inv) {
 
     lc_number:             String(ctrl.getRange(CFG.lcCell).getValue() || ''),
     buyers_order_no:       String(ctrl.getRange('C15').getValue() || ''),
-    notify_1:              '',  // Null for backend to populate; client fills manually in doc if needed
+    // Manually typed (CONTROL!C14) — printed verbatim on Annexure C point
+    // 9(c) and every CHA document's "NOTIFY 1" line. document_generator.py
+    // only falls back to the full buyer name/address/country blob when this
+    // is blank, so filling it in always wins.
+    notify_1:              String(ctrl.getRange(CFG.notifyCell1).getValue() || ''),
     notify_2:              '',  // Null for backend to populate; client fills manually in doc if needed
     terms_of_payment:      String(ctrl.getRange(CFG.termsOfPaymentCell || 'C23').getValue() || ''),
     company_seal_no:       String(ctrl.getRange(CFG.companySealNoCell).getValue() || ''),
@@ -2280,7 +2292,7 @@ function generatePIDocument() {
   const payload    = buildPayload(ss, ctrl, inv);
   const encodedInv = encodeURIComponent(inv);
   // Pass documents=proforma_invoice so backend generates PI FORMAT only
-  const fullUrl    = CFG.webhookUrl + 'generate?invoice_no=' + encodedInv + '&documents=proforma_invoice';
+  const fullUrl    = webhookBase_() + 'generate?invoice_no=' + encodedInv + '&documents=proforma_invoice';
 
   Logger.log('📤 PI URL: ' + fullUrl);
   Logger.log('📦 PI payload items: ' + JSON.stringify(payload.items));
@@ -2344,7 +2356,7 @@ function generateAnnexureCDocument() {
   const payload    = buildPayload(ss, ctrl, inv);
   const encodedInv = encodeURIComponent(inv);
   // Pass documents=annexure_c so backend generates Annexure C only
-  const fullUrl    = CFG.webhookUrl + 'generate?invoice_no=' + encodedInv + '&documents=annexure_c';
+  const fullUrl    = webhookBase_() + 'generate?invoice_no=' + encodedInv + '&documents=annexure_c';
 
   Logger.log('📤 Annexure C URL: ' + fullUrl);
 
@@ -2404,7 +2416,7 @@ function generateCHADocuments() {
 
   const payload    = buildPayload(ss, ctrl, inv);
   const encodedInv = encodeURIComponent(inv);
-  const fullUrl    = CFG.webhookUrl + 'generate?invoice_no=' + encodedInv + '&documents=cha_tax_invoice&documents=cha_packing_list&documents=cha_commercial_invoice';
+  const fullUrl    = webhookBase_() + 'generate?invoice_no=' + encodedInv + '&documents=cha_tax_invoice&documents=cha_packing_list&documents=cha_commercial_invoice';
 
   Logger.log('📤 CHA URL: ' + fullUrl);
 
@@ -2462,7 +2474,7 @@ function generateDocuments() {
 
   const payload    = buildPayload(ss, ctrl, inv);
   const encodedInv = encodeURIComponent(inv);
-  const fullUrl    = CFG.webhookUrl + 'generate?invoice_no=' + encodedInv;
+  const fullUrl    = webhookBase_() + 'generate?invoice_no=' + encodedInv;
 
   try {
     const res2 = UrlFetchApp.fetch(fullUrl, {
@@ -2888,7 +2900,7 @@ function exportCHAPackage() {
   const ui   = SpreadsheetApp.getUi();
   if (!inv) { ui.alert('❌ No Invoice', 'Set invoice number in C8 first.', ui.ButtonSet.OK); return; }
 
-  const fullUrl = CFG.webhookUrl + encodeURIComponent(inv) + '/cha-package';
+  const fullUrl = webhookBase_() + encodeURIComponent(inv) + '/cha-package';
   Logger.log('🚀 Calling CHA Package endpoint: ' + fullUrl);
 
   try {
@@ -3190,7 +3202,7 @@ function setupPortDropdowns() {
 // reordered, this keeps working without needing an update here too.
 var LOOKUP_DROPDOWN_MAP_ = [
   { header: 'Countries',      cells: ['F23', 'H22'] },  // Country of Origin, Country of Final Destination / buyer country
-  { header: 'Ports',          cells: ['C21', 'F21'] },  // Port of Loading, Port of Discharge
+  { header: 'Ports',          cells: ['C21', 'F21', 'C22'] },  // Port of Loading, Port of Discharge, Final Destination (CHA CI)
   { header: 'Container Types',cells: ['F37'] },          // Type of Container (Annexure C item 14)
   { header: 'Payment Terms',  cells: ['C23'] },
   { header: 'ICST Rates',     cells: ['F29'] },

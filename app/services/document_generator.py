@@ -1,8 +1,15 @@
 import logging
 import os
+import shutil
+import subprocess
+import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
+from docx import Document as DocxDocument
+from docx.enum.table import WD_ROW_HEIGHT_RULE
+from docx.shared import Length, Pt
 from docxtpl import DocxTemplate
 from num2words import num2words
 
@@ -12,6 +19,205 @@ TEMPLATE_DIR = Path("templates")
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 BASE_DOWNLOAD_URL = os.getenv("BASE_DOWNLOAD_URL", "http://localhost:8080/output").rstrip("/")
+
+# ── One-page enforcement ─────────────────────────────────────────────────────
+# Every generated document except DBK gets forced onto a single page: start
+# at ONE_PAGE_DEFAULT_PT (the client's requested default), and if it still
+# overflows, uniformly shrink every run's font size down through
+# ONE_PAGE_SIZE_LADDER_PT until either it fits on one page or the floor
+# (ONE_PAGE_MIN_PT) is reached — at the floor we accept whatever overflow is
+# left rather than shrink further into illegibility. "Fits" is verified for
+# real (not guessed) by round-tripping through LibreOffice headless to PDF
+# and counting actual pages — python-docx has no layout engine of its own,
+# so there is no way to know how many pages a .docx will render to without
+# actually rendering it.
+ONE_PAGE_EXCLUDED_TEMPLATES = {"DBK_Declaration.docx"}
+ONE_PAGE_DEFAULT_PT = 10
+ONE_PAGE_MIN_PT = 7
+ONE_PAGE_SIZE_LADDER_PT = [10, 9, 8, 7]
+ONE_PAGE_SOFFICE_TIMEOUT_SEC = 60
+
+# Each document's own title heading (e.g. "COMMERCIAL INVOICE", "PACKING
+# LIST") is exempted from the uniform shrink below and pinned to this size
+# instead — the client wants the document name to stay legible even at the
+# smallest compression step, while every other run still follows the ladder.
+# Matched by exact paragraph text (post-trim, case-insensitive) against the
+# literal title text baked into each template — confirmed via inspection of
+# templates/*.docx (some, like "ANX C.docx", carry the title inside a table
+# cell rather than a body paragraph; _iter_all_paragraphs already covers both).
+ONE_PAGE_TITLE_PT = 17
+ONE_PAGE_TITLE_TEXTS = {
+    "COMMERCIAL INVOICE", "PACKING LIST", "TAX INVOICE", "PROFORMA INVOICE",
+    "ANNEXURE -1", "ANNEXURE C",
+}
+
+
+def _iter_table_paragraphs(table):
+    """Yields every paragraph in a table's cells, recursing into nested tables."""
+    for row in table.rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                yield p
+            for nested in cell.tables:
+                yield from _iter_table_paragraphs(nested)
+
+
+def _iter_all_paragraphs(doc: "DocxDocument"):
+    """Yields every paragraph in the document: body, all tables (incl. nested),
+    and every section's header/footer (and any tables inside those)."""
+    for p in doc.paragraphs:
+        yield p
+    for t in doc.tables:
+        yield from _iter_table_paragraphs(t)
+    for section in doc.sections:
+        for part in (section.header, section.footer):
+            for p in part.paragraphs:
+                yield p
+            for t in part.tables:
+                yield from _iter_table_paragraphs(t)
+
+
+def _iter_table_tables(table):
+    """Yields a table and every table nested inside its cells, recursively."""
+    yield table
+    for row in table.rows:
+        for cell in row.cells:
+            for nested in cell.tables:
+                yield from _iter_table_tables(nested)
+
+
+def _iter_all_tables(doc: "DocxDocument"):
+    """Yields every table in the document: body, every section's header/
+    footer, and all nested tables — mirrors _iter_all_paragraphs above."""
+    for t in doc.tables:
+        yield from _iter_table_tables(t)
+    for section in doc.sections:
+        for part in (section.header, section.footer):
+            for t in part.tables:
+                yield from _iter_table_tables(t)
+
+
+def _snapshot_row_heights(doc: "DocxDocument"):
+    """Captures every table row's original (template-authored) 'at least'
+    minimum height, once, before any ladder step touches it. Rows with
+    hRule=EXACTLY or AUTO are left alone — EXACTLY clips overflow content if
+    shrunk incorrectly, and AUTO already sizes itself to content. 'At least'
+    rows are the only ones safe to shrink and the only kind found in the
+    current templates (confirmed by inspection).
+
+    Why this exists: shrinking font size alone (_set_all_font_sizes) doesn't
+    reclaim page space held by static header/footer rows, because their
+    minimum heights were authored around the template's original, larger
+    font and don't shrink just because the text inside got smaller — the
+    row simply gains extra empty padding instead. A row whose content
+    genuinely needs more room (e.g. the per-vehicle description list) still
+    grows past this minimum regardless, so scaling the minimum down never
+    clips real content — it only removes the leftover padding that was
+    sized for a bigger font.
+    """
+    snapshot = []
+    for table in _iter_all_tables(doc):
+        for row in table.rows:
+            if row.height_rule == WD_ROW_HEIGHT_RULE.AT_LEAST and row.height:
+                snapshot.append((row, int(row.height)))
+    return snapshot
+
+
+def _scale_row_heights(snapshot, ratio: float) -> None:
+    """Rewrites every snapshotted row's minimum height to `ratio` of its
+    original (template-authored) value — absolute, not cumulative, so this
+    is safe to call again on every ladder step regardless of order."""
+    for row, original_emu in snapshot:
+        row.height = Length(max(1, round(original_emu * ratio)))
+
+
+def _set_all_font_sizes(doc: "DocxDocument", pt_size: int) -> None:
+    """Uniformly overwrites every run's font size — labels, headers and data
+    alike — per the client's "shrink everything together" preference, EXCEPT
+    each document's title heading (see ONE_PAGE_TITLE_TEXTS), which is pinned
+    to ONE_PAGE_TITLE_PT instead so the document name stays readable no
+    matter how far the rest of the page has to shrink. Bold/italic/underline
+    and font family are untouched; only the size changes."""
+    size = Pt(pt_size)
+    title_size = Pt(ONE_PAGE_TITLE_PT)
+    for paragraph in _iter_all_paragraphs(doc):
+        run_size = title_size if paragraph.text.strip().upper() in ONE_PAGE_TITLE_TEXTS else size
+        for run in paragraph.runs:
+            run.font.size = run_size
+
+
+def _convert_to_pdf(docx_path: Path, out_dir: Path) -> Path:
+    """Headless LibreOffice docx->pdf conversion, isolated to its own scratch
+    user profile per call — soffice locks its profile directory, so two
+    conversions running with the default profile at the same time can hang
+    or fail. Raises on non-zero exit or missing output (caller decides how
+    to handle: see enforce_one_page_).
+    """
+    profile_dir = out_dir / f"soffice_profile_{uuid.uuid4().hex}"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            [
+                "soffice", "--headless", "--norestore",
+                f"-env:UserInstallation=file://{profile_dir}",
+                "--convert-to", "pdf", "--outdir", str(out_dir), str(docx_path),
+            ],
+            check=True, capture_output=True, timeout=ONE_PAGE_SOFFICE_TIMEOUT_SEC,
+        )
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+    pdf_path = out_dir / (docx_path.stem + ".pdf")
+    if not pdf_path.exists():
+        raise RuntimeError(f"soffice did not produce {pdf_path}")
+    return pdf_path
+
+
+def _count_pdf_pages(pdf_path: Path) -> int:
+    result = subprocess.run(
+        ["pdfinfo", str(pdf_path)], check=True, capture_output=True, text=True,
+        timeout=ONE_PAGE_SOFFICE_TIMEOUT_SEC,
+    )
+    for line in result.stdout.splitlines():
+        if line.startswith("Pages:"):
+            return int(line.split(":", 1)[1].strip())
+    raise RuntimeError(f"pdfinfo output for {pdf_path} had no 'Pages:' line")
+
+
+def enforce_one_page(docx_path: Path, template_name: str) -> None:
+    """Mutates the saved .docx in place so it renders to one page, per the
+    client's request — skipped entirely for DBK (see
+    ONE_PAGE_EXCLUDED_TEMPLATES; that document is expected to run long).
+    Any failure here (soffice missing, conversion error, etc.) is logged and
+    swallowed rather than failing the whole generation — the document still
+    exists at whatever size was last successfully set, just not guaranteed
+    one-page, which is strictly better than losing the document entirely.
+    """
+    if template_name in ONE_PAGE_EXCLUDED_TEMPLATES:
+        return
+
+    with tempfile.TemporaryDirectory(prefix="one_page_check_") as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        try:
+            doc = DocxDocument(str(docx_path))
+            row_height_snapshot = _snapshot_row_heights(doc)
+            for size_pt in ONE_PAGE_SIZE_LADDER_PT:
+                _set_all_font_sizes(doc, size_pt)
+                _scale_row_heights(row_height_snapshot, size_pt / ONE_PAGE_DEFAULT_PT)
+                doc.save(str(docx_path))
+
+                pdf_path = _convert_to_pdf(docx_path, tmp_dir)
+                pages = _count_pdf_pages(pdf_path)
+                pdf_path.unlink(missing_ok=True)
+
+                logger.info(f"[one-page] {template_name} @ {size_pt}pt -> {pages} page(s)")
+                if pages <= 1:
+                    return
+            logger.warning(
+                f"[one-page] {template_name} still {pages} page(s) at the {ONE_PAGE_MIN_PT}pt "
+                "floor — leaving as-is rather than shrinking further."
+            )
+        except Exception as e:
+            logger.error(f"[one-page] {template_name} enforcement failed, leaving document as rendered: {e}", exc_info=True)
 
 # Maps each DOCX template to the description field it should use from Item
 TEMPLATE_DESC_FIELD = {
@@ -405,6 +611,8 @@ def generate_document(template_name: str, payload: Any, invoice_no: str) -> Dict
         output_filename = f"{safe_invoice}_{template_name}"
         output_path = OUTPUT_DIR / output_filename
         doc.save(str(output_path))
+
+        enforce_one_page(output_path, template_name)
 
         logger.info(f"[{invoice_no}] {template_name} generated locally at {output_path}")
         return {

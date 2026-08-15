@@ -68,7 +68,7 @@ const CFG = {
   // fixed per-model property, so it moved off the Products tab onto its own
   // CONTROL cell here rather than being read via genProd[19] anymore.
   invoiceCodeCell:        'F17',
-  webhookUrl: 'https://engagement-dramatically-peas-defines.trycloudflare.com/api/v1/invoices/',
+  webhookUrl: 'https://artwork-robertson-patrol-assuming.trycloudflare.com/api/v1/invoices/',
 };
 
 // A stray leading/trailing space pasted alongside a new Cloudflare tunnel
@@ -1881,14 +1881,14 @@ function buildPayload(ss, ctrl, inv) {
     Logger.log('    district(G)="' + districtCode + '" | state(H)="' + stateCode + '"');
 
     // Append product_name (col B) and model name to a description — only
-    // still used for SCOMET / Tax Invoice / Annexure-1 / CHA TI below. PI,
-    // Commercial Invoice, CHA CI and Packing List used to go through this
-    // too, but the Products-tab text for those already spells out the model
+    // still used for Tax Invoice / Annexure-1 below. PI, Commercial Invoice,
+    // CHA CI, Packing List, SCOMET and CHA TI used to go through this too,
+    // but the Products-tab text for those already spells out the model
     // itself (e.g. "TOYOTA URBAN CRUISER TAISOR V AT TURBO 998 CC...") —
     // appending product_name/model again just duplicated it at the end
-    // ("...MANUFACTURING YEAR 2026 TOYOTA URBAN CRUISER TAISOR"), so those 4
-    // now print descPi/descComm/descChaCi/descPacking exactly as typed,
-    // same as description_cha_pl already does.
+    // ("...MANUFACTURING YEAR 2026 TOYOTA URBAN CRUISER TAISOR"), so those 6
+    // now print descPi/descComm/descChaCi/descPacking/descScomet/descChaTi
+    // exactly as typed, same as description_cha_pl already does.
     var modelDisplay = v.model || modelKey;
     function withModel(base) {
       var parts = [base];
@@ -1903,7 +1903,7 @@ function buildPayload(ss, ctrl, inv) {
         hsn_code_pi:            hsnCodePi,
         description:            descPi,  // default = PI FORMAT desc; backend overrides per-template
         description_commercial: descComm,
-        description_scomet:     withModel(descScomet),
+        description_scomet:     descScomet,  // printed exactly as typed on Products tab — no model name appended
         description_packing:    descPacking,
         description_tax:        withModel(descTax),
         description_pi:         descPi,
@@ -2486,7 +2486,10 @@ function generateDocuments() {
 
     if (code === 200 || code === 201) {
       logAudit(inv, 'GENERATED', 'Mode:' + mode);
-      showDownloadDialog(JSON.parse(body), inv);
+      // hideDedicatedDocs=true — this is the "Generate All Documents" path,
+      // the one case where PI/Tax Invoice/CHA*/Annexure C should be hidden
+      // from the individual list (see HIDE_FROM_LIST_WHEN_GENERATE_ALL_).
+      showDownloadDialog(JSON.parse(body), inv, true);
     } else {
       logAudit(inv, 'FAILED', 'HTTP ' + code);
       ui.alert('❌ Backend Error (HTTP ' + code + ')', body.substring(0, 800), ui.ButtonSet.OK);
@@ -2497,15 +2500,78 @@ function generateDocuments() {
   }
 }
 
-function showDownloadDialog(result, invoiceNo) {
-  const files      = result.generated_files || [];
+// Documents that already have their own dedicated generation entry point
+// (⚡ Horizon → Generate PI Only / Generate CHA Documents / Generate
+// Annexure C Only) — the bulk "Download All" button skips these so it
+// doesn't turn every "Generate All Documents" run into 5 extra tabs the
+// user almost never wants alongside the core export set. Keyed by the
+// DOCUMENT_MAP key the backend returns in each file's `template` field
+// (see app/routers/documents.py), NOT the .docx filename. Individual
+// download links for these documents still show in the list below — only
+// the bulk button skips them.
+var DOWNLOAD_ALL_EXCLUDED_TEMPLATES_ = ['proforma_invoice', 'annexure_c', 'cha_tax_invoice', 'cha_packing_list', 'cha_commercial_invoice'];
+
+// Tax Invoice isn't needed going forward — hidden completely, in every
+// showDownloadDialog call (Generate All, Generate CHA Documents, etc.),
+// from both the individual download list AND the Download All bundle.
+// Purely a display-layer filter: the backend still generates and saves
+// Tax_Invoice.docx exactly as before (no backend change requested), this
+// just stops it from ever showing up in the dialog. Add more template keys
+// here later if another document should stop being shown everywhere too.
+var ALWAYS_HIDDEN_TEMPLATES_ = ['tax_invoice'];
+
+// Only used when showDownloadDialog is called with hideDedicatedDocs=true
+// (i.e. from "Generate All Documents") — these get hidden from the
+// individual "Downloads" list entirely, not just skipped by the bulk
+// button, since PI FORMAT / every CHA document / Annexure C already have
+// their own dedicated ⚡ Horizon menu items to generate and download them
+// one at a time. Still fully generated and saved server-side (and PI/CHA/
+// Annexure C still count toward the bulk download-all exclusion above) —
+// just not shown as a row here to reduce clutter on a "Generate All" run.
+// Keyed by the DOCUMENT_MAP `template` key, same as above. tax_invoice is
+// NOT listed here — it's handled by ALWAYS_HIDDEN_TEMPLATES_ instead, since
+// that one should stay hidden even outside a "Generate All" run.
+var HIDE_FROM_LIST_WHEN_GENERATE_ALL_ = ['proforma_invoice', 'cha_commercial_invoice', 'cha_packing_list', 'cha_tax_invoice', 'annexure_c'];
+
+function showDownloadDialog(result, invoiceNo, hideDedicatedDocs) {
+  const files      = (result.generated_files || []).filter(function(f) {
+    return ALWAYS_HIDDEN_TEMPLATES_.indexOf(f.template) === -1;
+  });
   const failed     = result.failed || [];
   const folderUrl  = result.drive_folder_url || '';
+
+  // DOWNLOAD_ALL_EXCLUDED_TEMPLATES_ only matters on the "Generate All" run
+  // (hideDedicatedDocs=true) — it exists so THAT bundle doesn't smuggle in
+  // PI/CHA*/Annexure C, which already have their own dedicated generate-and-
+  // download flows elsewhere. Any other caller (generateCHADocuments(),
+  // etc.) reuses this exact same dialog/function to show only the file set
+  // IT generated — e.g. the CHA dialog only ever receives the 3 CHA docs —
+  // so Download All there should bundle all of them, not filter them back
+  // out via the same exclusion list built for a completely different context.
+  const downloadAllFiles = files.filter(function(f) {
+    var excludedHere = hideDedicatedDocs && DOWNLOAD_ALL_EXCLUDED_TEMPLATES_.indexOf(f.template) !== -1;
+    return !excludedHere && (f.gcs_url || f.drive_url);
+  }).map(function(f) {
+    return { name: f.download_name || f.document || f.template || 'document', url: f.gcs_url || f.drive_url };
+  });
+
+  // Only trims the individual list — generateCHADocuments()/generatePIDocument()/
+  // generateAnnexureCDocument() never pass hideDedicatedDocs, so their own
+  // dialogs (which exist specifically to show exactly those files) are unaffected.
+  const listedFiles = hideDedicatedDocs
+    ? files.filter(function(f) { return HIDE_FROM_LIST_WHEN_GENERATE_ALL_.indexOf(f.template) === -1; })
+    : files;
+  const hiddenCount = files.length - listedFiles.length;
 
   let html =
     '<style>body{font-family:Arial,sans-serif;padding:20px;background:#f8fafc}h2{color:#1e3a5f;text-align:center;margin-bottom:4px}' +
     '.sub{text-align:center;color:#64748b;font-size:13px;margin-bottom:14px}' +
-    '.folder-btn{display:block;width:100%;padding:12px;background:#1e3a5f;color:white;text-align:center;text-decoration:none;font-size:14px;font-weight:bold;border-radius:8px;margin-bottom:14px}' +
+    '.folder-btn{display:block;width:100%;padding:12px;background:#1e3a5f;color:white;text-align:center;text-decoration:none;font-size:14px;font-weight:bold;border-radius:8px;margin-bottom:10px}' +
+    '.download-all-wrap{text-align:center;margin-bottom:6px}' +
+    '.download-all-btn{display:inline-block;padding:10px 26px;background:#0d9488;color:white;border:none;font-size:14px;font-weight:bold;border-radius:8px;cursor:pointer}' +
+    '.download-all-btn:hover:not(:disabled){background:#0f766e}' +
+    '.download-all-btn:disabled{opacity:.6;cursor:not-allowed}' +
+    '.download-all-note{text-align:center;color:#94a3b8;font-size:11px;margin:8px 0 14px}' +
     '.file-item{padding:10px 12px;margin:6px 0;background:white;border-radius:8px;display:flex;justify-content:space-between;align-items:center;box-shadow:0 1px 3px rgba(0,0,0,.1)}' +
     '.file-name{font-size:12px;color:#334155;flex:1}' +
     '.download-btn{background:#0d9488;color:white;padding:6px 14px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:12px;white-space:nowrap;margin-left:10px}' +
@@ -2513,14 +2579,20 @@ function showDownloadDialog(result, invoiceNo) {
     '.section{font-size:11px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.5px;margin:12px 0 6px}' +
     '</style>' +
     '<h2>✅ Documents Generated!</h2>' +
-    '<p class="sub"><strong>Invoice:</strong> ' + invoiceNo + ' &nbsp;·&nbsp; ' + files.length + ' file(s) ready</p>';
+    '<p class="sub"><strong>Invoice:</strong> ' + invoiceNo + ' &nbsp;·&nbsp; ' + listedFiles.length + ' file(s) ready</p>';
 
   if (folderUrl)
     html += '<a href="' + folderUrl + '" target="_blank" class="folder-btn">📂 Open Drive Folder</a>';
 
-  if (files.length > 0) {
-    html += '<div class="section">Downloads</div>';
-    files.forEach(function(file) {
+  if (downloadAllFiles.length > 0) {
+    html += '<div class="download-all-wrap"><button class="download-all-btn" id="downloadAllBtn" onclick="downloadAllFiles()">⬇️ Download All (' + downloadAllFiles.length + ')</button></div>';
+    if (hideDedicatedDocs)
+      html += '<p class="download-all-note">PI FORMAT, Annexure C and CHA documents are excluded — use their own menu items to generate/download those.</p>';
+  }
+
+  if (listedFiles.length > 0) {
+    html += '<div class="section">Downloads' + (hiddenCount > 0 ? ' <span style="text-transform:none;font-weight:400;color:#94a3b8">(' + hiddenCount + ' more via their own menu items)</span>' : '') + '</div>';
+    listedFiles.forEach(function(file) {
       const docName = file.document || file.download_name || file.template || 'Document';
       const url     = file.gcs_url || file.drive_url || '';
       if (url)
@@ -2534,6 +2606,135 @@ function showDownloadDialog(result, invoiceNo) {
       html += '<div class="failed-item">❌ ' + (f.template || f.document || 'Unknown') + ': ' + (f.error || 'error') + '</div>';
     });
   }
+
+  var downloadAllLabel = '⬇️ Download All (' + downloadAllFiles.length + ')';
+
+  // Two earlier attempts (a synchronous click loop, then dropping
+  // target="_blank") both still resulted in "only one at a time". Root
+  // cause: Chrome (and other browsers) throttle *automatic* multi-file
+  // downloads as a distinct, separate protection from popup blockers — a
+  // page that triggers 2+ real downloads without a fresh user gesture per
+  // file gets silently capped at one, and unblocking it requires the user
+  // to notice a small "blocked" icon in the address bar and manually
+  // choose Allow. No amount of client JS restructuring gets around that,
+  // because the browser is deliberately counting real download events.
+  //
+  // The fix is to never ask the browser for N downloads at all: fetch
+  // every file with plain fetch() (fetches aren't downloads, so the
+  // throttle never engages), bundle them into a single .zip entirely
+  // client-side (a minimal hand-rolled STORE-only zip writer — no external
+  // library, so no CDN/CSP dependency), and trigger exactly ONE download
+  // of the archive. This also sidesteps a second problem server-side
+  // bundling would have hit: these file URLs point at localhost (the
+  // machine actually running the FastAPI backend), which only the user's
+  // own browser can reach — Google's Apps Script servers have no route to
+  // it, so UrlFetchApp could never have fetched them to zip on that side.
+  var clientScript = '' +
+    'var DOWNLOAD_ALL_FILES = ' + JSON.stringify(downloadAllFiles) + ';\n' +
+    'var DOWNLOAD_ALL_LABEL = ' + JSON.stringify(downloadAllLabel) + ';\n' +
+    'var DOWNLOAD_ALL_INVOICE = ' + JSON.stringify(invoiceNo) + ';\n' +
+    'function crc32(buf) {\n' +
+    '  var table = crc32.table || (crc32.table = (function () {\n' +
+    '    var c, t = [];\n' +
+    '    for (var n = 0; n < 256; n++) {\n' +
+    '      c = n;\n' +
+    '      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);\n' +
+    '      t[n] = c;\n' +
+    '    }\n' +
+    '    return t;\n' +
+    '  })());\n' +
+    '  var crc = 0 ^ (-1);\n' +
+    '  for (var i = 0; i < buf.length; i++) crc = (crc >>> 8) ^ table[(crc ^ buf[i]) & 0xFF];\n' +
+    '  return (crc ^ (-1)) >>> 0;\n' +
+    '}\n' +
+    'function dosDateTime() {\n' +
+    '  var d = new Date();\n' +
+    '  return {\n' +
+    '    time: ((d.getHours() & 0x1F) << 11) | ((d.getMinutes() & 0x3F) << 5) | (Math.floor(d.getSeconds() / 2) & 0x1F),\n' +
+    '    date: (((d.getFullYear() - 1980) & 0x7F) << 9) | (((d.getMonth() + 1) & 0xF) << 5) | (d.getDate() & 0x1F)\n' +
+    '  };\n' +
+    '}\n' +
+    'function buildZip(files) {\n' +
+    '  var encoder = new TextEncoder();\n' +
+    '  var localParts = [], centralParts = [], offset = 0;\n' +
+    '  files.forEach(function (f) {\n' +
+    '    var nameBytes = encoder.encode(f.name);\n' +
+    '    var data = f.data, crc = crc32(data), dt = dosDateTime(), size = data.length;\n' +
+    '    var local = new Uint8Array(30 + nameBytes.length);\n' +
+    '    var lv = new DataView(local.buffer);\n' +
+    '    lv.setUint32(0, 0x04034b50, true);\n' +
+    '    lv.setUint16(4, 20, true);\n' +
+    '    lv.setUint16(6, 0, true);\n' +
+    '    lv.setUint16(8, 0, true);\n' +
+    '    lv.setUint16(10, dt.time, true);\n' +
+    '    lv.setUint16(12, dt.date, true);\n' +
+    '    lv.setUint32(14, crc, true);\n' +
+    '    lv.setUint32(18, size, true);\n' +
+    '    lv.setUint32(22, size, true);\n' +
+    '    lv.setUint16(26, nameBytes.length, true);\n' +
+    '    lv.setUint16(28, 0, true);\n' +
+    '    local.set(nameBytes, 30);\n' +
+    '    localParts.push(local, data);\n' +
+    '    var central = new Uint8Array(46 + nameBytes.length);\n' +
+    '    var cv = new DataView(central.buffer);\n' +
+    '    cv.setUint32(0, 0x02014b50, true);\n' +
+    '    cv.setUint16(4, 20, true);\n' +
+    '    cv.setUint16(6, 20, true);\n' +
+    '    cv.setUint16(8, 0, true);\n' +
+    '    cv.setUint16(10, 0, true);\n' +
+    '    cv.setUint16(12, dt.time, true);\n' +
+    '    cv.setUint16(14, dt.date, true);\n' +
+    '    cv.setUint32(16, crc, true);\n' +
+    '    cv.setUint32(20, size, true);\n' +
+    '    cv.setUint32(24, size, true);\n' +
+    '    cv.setUint16(28, nameBytes.length, true);\n' +
+    '    cv.setUint16(30, 0, true);\n' +
+    '    cv.setUint16(32, 0, true);\n' +
+    '    cv.setUint16(34, 0, true);\n' +
+    '    cv.setUint16(36, 0, true);\n' +
+    '    cv.setUint32(38, 0, true);\n' +
+    '    cv.setUint32(42, offset, true);\n' +
+    '    central.set(nameBytes, 46);\n' +
+    '    centralParts.push(central);\n' +
+    '    offset += local.length + data.length;\n' +
+    '  });\n' +
+    '  var centralStart = offset;\n' +
+    '  var centralSize = centralParts.reduce(function (s, p) { return s + p.length; }, 0);\n' +
+    '  var end = new Uint8Array(22);\n' +
+    '  var ev = new DataView(end.buffer);\n' +
+    '  ev.setUint32(0, 0x06054b50, true);\n' +
+    '  ev.setUint16(8, files.length, true);\n' +
+    '  ev.setUint16(10, files.length, true);\n' +
+    '  ev.setUint32(12, centralSize, true);\n' +
+    '  ev.setUint32(16, centralStart, true);\n' +
+    '  return new Blob(localParts.concat(centralParts, [end]), { type: "application/zip" });\n' +
+    '}\n' +
+    'function downloadAllFiles() {\n' +
+    '  var btn = document.getElementById("downloadAllBtn");\n' +
+    '  if (btn) { btn.disabled = true; btn.textContent = "Fetching files…"; }\n' +
+    '  Promise.all(DOWNLOAD_ALL_FILES.map(function (f) {\n' +
+    '    return fetch(f.url).then(function (r) {\n' +
+    '      if (!r.ok) throw new Error(f.name + ": HTTP " + r.status);\n' +
+    '      return r.arrayBuffer().then(function (buf) { return { name: f.name, data: new Uint8Array(buf) }; });\n' +
+    '    });\n' +
+    '  })).then(function (fetched) {\n' +
+    '    if (btn) btn.textContent = "Building zip…";\n' +
+    '    var zipBlob = buildZip(fetched);\n' +
+    '    var url = URL.createObjectURL(zipBlob);\n' +
+    '    var a = document.createElement("a");\n' +
+    '    a.href = url;\n' +
+    '    a.download = "Invoice_" + DOWNLOAD_ALL_INVOICE.replace(/[^a-zA-Z0-9_-]/g, "_") + "_Documents.zip";\n' +
+    '    document.body.appendChild(a);\n' +
+    '    a.click();\n' +
+    '    document.body.removeChild(a);\n' +
+    '    setTimeout(function () { URL.revokeObjectURL(url); }, 30000);\n' +
+    '    if (btn) { btn.disabled = false; btn.textContent = DOWNLOAD_ALL_LABEL; }\n' +
+    '  }).catch(function (err) {\n' +
+    '    alert("Download All failed: " + err.message);\n' +
+    '    if (btn) { btn.disabled = false; btn.textContent = DOWNLOAD_ALL_LABEL; }\n' +
+    '  });\n' +
+    '}\n';
+  html += '<script>' + clientScript + '<\/script>';
 
   SpreadsheetApp.getUi().showModalDialog(
     HtmlService.createHtmlOutput(html).setWidth(560).setHeight(560),

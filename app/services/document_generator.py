@@ -39,16 +39,18 @@ ONE_PAGE_MIN_PT = 7
 ONE_PAGE_SIZE_LADDER_PT = [11, 10, 9, 8, 7]
 ONE_PAGE_SOFFICE_TIMEOUT_SEC = 60
 
-# Commercial Invoice and Packing List must never shrink below 11pt, even if
-# that means real content spills onto a second page — client explicitly
-# prioritized readability over the one-page guarantee for these two
-# specifically (confirmed via reproduction: a genuine heavy shipment, e.g. 3
-# item rows with a full CI trailer block, needs down to 7-8pt to fit on one
-# page, which was too small to read). Every other template keeps the full
-# ONE_PAGE_SIZE_LADDER_PT ladder down to ONE_PAGE_MIN_PT.
+# Commercial Invoice and Packing List floor at 10pt, not the full
+# ONE_PAGE_SIZE_LADDER_PT ladder down to ONE_PAGE_MIN_PT — client wants 11pt
+# whenever it fits, and is willing to drop ONE step to 10pt (still clearly
+# readable) rather than spill to a second page, but no further than that
+# (confirmed via reproduction: a genuine heavy shipment, e.g. 3 item rows
+# with a full CI trailer block, needs down to 7-8pt to fit on one page,
+# which was too small to read — 10pt is the accepted compromise floor).
+# Every other template keeps the full ONE_PAGE_SIZE_LADDER_PT ladder down to
+# ONE_PAGE_MIN_PT.
 ONE_PAGE_TEMPLATE_MIN_PT_OVERRIDE = {
-    "new_commercial_invoice1.docx": 11,
-    "Packing_List.docx": 11,
+    "new_commercial_invoice1.docx": 10,
+    "Packing_List.docx": 10,
 }
 
 # Applied to every "at least" row height on EVERY ladder step, including the

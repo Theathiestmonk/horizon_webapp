@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Dict
 from docx import Document as DocxDocument
 from docx.enum.table import WD_ROW_HEIGHT_RULE
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Length, Pt
 from docxtpl import DocxTemplate
 from num2words import num2words
@@ -32,10 +34,36 @@ BASE_DOWNLOAD_URL = os.getenv("BASE_DOWNLOAD_URL", "http://localhost:8080/output
 # so there is no way to know how many pages a .docx will render to without
 # actually rendering it.
 ONE_PAGE_EXCLUDED_TEMPLATES = {"DBK_Declaration.docx"}
-ONE_PAGE_DEFAULT_PT = 10
+ONE_PAGE_DEFAULT_PT = 11
 ONE_PAGE_MIN_PT = 7
-ONE_PAGE_SIZE_LADDER_PT = [10, 9, 8, 7]
+ONE_PAGE_SIZE_LADDER_PT = [11, 10, 9, 8, 7]
 ONE_PAGE_SOFFICE_TIMEOUT_SEC = 60
+
+# Commercial Invoice and Packing List must never shrink below 11pt, even if
+# that means real content spills onto a second page — client explicitly
+# prioritized readability over the one-page guarantee for these two
+# specifically (confirmed via reproduction: a genuine heavy shipment, e.g. 3
+# item rows with a full CI trailer block, needs down to 7-8pt to fit on one
+# page, which was too small to read). Every other template keeps the full
+# ONE_PAGE_SIZE_LADDER_PT ladder down to ONE_PAGE_MIN_PT.
+ONE_PAGE_TEMPLATE_MIN_PT_OVERRIDE = {
+    "new_commercial_invoice1.docx": 11,
+    "Packing_List.docx": 11,
+}
+
+# Applied to every "at least" row height on EVERY ladder step, including the
+# very first (at ONE_PAGE_DEFAULT_PT) — without this, row-height scaling
+# only kicked in once the ladder had already dropped BELOW the default font
+# size (ratio was exactly 1.0 on the first try), so genuinely wasted
+# template-authored padding never got reclaimed on the one attempt that
+# matters most: whether the document fits at the default size at all. Empirically
+# confirmed via a real reproduction (PI FORMAT with 5 vehicles, which spilled
+# one line onto an otherwise-empty page 2 purely from this unclaimed padding):
+# 0.85 was the threshold that brought it back to one page at the full
+# ONE_PAGE_DEFAULT_PT, with no visible clipping — "at least" rows can never
+# be clipped by this, they simply grow back past the reduced minimum if
+# their actual content needs more room.
+ONE_PAGE_ROW_HEIGHT_BASELINE_RATIO = 0.85
 
 # Each document's own title heading (e.g. "COMMERCIAL INVOICE", "PACKING
 # LIST") is exempted from the uniform shrink below and pinned to this size
@@ -50,6 +78,26 @@ ONE_PAGE_TITLE_TEXTS = {
     "COMMERCIAL INVOICE", "PACKING LIST", "TAX INVOICE", "PROFORMA INVOICE",
     "ANNEXURE -1", "ANNEXURE C",
 }
+
+# The exporter's static "HORIZON ENTERPRISE" name + address block that sits
+# at the bottom of most templates (below the main content, outside any
+# {{ exporter.* }} placeholder) — same pin-instead-of-shrink treatment as
+# the title above. Company name matched by exact text; the address line
+# varies slightly per template (with/without "Email:.../Website:...", "E-802"
+# vs "E 802" spacing — confirmed via inspection of templates/*.docx) so it's
+# matched by prefix/substring instead of an exact-text set.
+ONE_PAGE_COMPANY_NAME_PT = 14
+ONE_PAGE_COMPANY_NAME_TEXTS = {"HORIZON ENTERPRISE"}
+ONE_PAGE_ADDRESS_PT = 12
+
+
+def _is_footer_address_paragraph(text_upper: str) -> bool:
+    return (
+        text_upper.startswith("E-802") or text_upper.startswith("E 802")
+        or "SAFAL PARISAR" in text_upper
+        or text_upper.startswith("EMAIL:") or text_upper.startswith("EMAIL :")
+        or "WEBSITE:" in text_upper
+    )
 
 
 def _iter_table_paragraphs(table):
@@ -75,6 +123,32 @@ def _iter_all_paragraphs(doc: "DocxDocument"):
                 yield p
             for t in part.tables:
                 yield from _iter_table_paragraphs(t)
+
+
+def _iter_body_and_header_footer_paragraphs(doc: "DocxDocument"):
+    """Yields only NON-table paragraphs: plain body paragraphs plus each
+    section's header/footer paragraphs — deliberately excluding every table
+    cell (doc.tables AND any header/footer tables).
+
+    Used only for the company-name/address pin below. Several templates
+    render {{ exporter.company_name }} / {{ exporter.address }} more than
+    once — the top "EXPORTER / MANUFACTURER" block and a "FOR
+    {{ exporter.company_name }}" signature line both live in table cells —
+    and once Jinja substitutes the real company name into both, they become
+    text-identical to the genuine footer occurrence, so text matching alone
+    can't tell them apart. Structural position can: inspection of
+    templates/*.docx confirmed the real "HORIZON ENTERPRISE" + address block
+    is always either a plain body paragraph (Packing_List.docx) or a true
+    Word section footer (CHA TI.docx, CHA PL.docx) — never a table cell in
+    either case — so restricting the pin to this iterator is what correctly
+    excludes the in-table lookalikes.
+    """
+    for p in doc.paragraphs:
+        yield p
+    for section in doc.sections:
+        for part in (section.header, section.footer):
+            for p in part.paragraphs:
+                yield p
 
 
 def _iter_table_tables(table):
@@ -131,19 +205,121 @@ def _scale_row_heights(snapshot, ratio: float) -> None:
         row.height = Length(max(1, round(original_emu * ratio)))
 
 
+def _set_paragraph_mark_size(paragraph, pt_size: "Pt") -> None:
+    """Sets the font size of a paragraph's own end-of-paragraph mark (the
+    'rPr' nested inside 'pPr') — this is what determines the line height of
+    an otherwise-EMPTY paragraph (zero runs), which the run-only loop in
+    _set_all_font_sizes can never reach since there are no runs to iterate.
+
+    Why this matters: a template can have several trailing blank paragraphs
+    after its closing table (leftover spacer formatting, e.g. CHA TI.docx
+    has 6 empty paragraphs after the main table). Left untouched, each one
+    keeps whatever size the template originally authored — confirmed via
+    inspection to be a FIXED 11pt regardless of template — at every ladder
+    step, even once the ladder has shrunk everything else down to 9pt or
+    7pt. That's a real, sizeable chunk of vertical space (roughly half an
+    inch across 6 paragraphs) that font-size shrinking silently never
+    reclaims, which is exactly why CHA TI needed to shrink all the way to
+    9pt to fit one page despite having visible slack once it got there —
+    confirmed by direct reproduction: forcing 11pt showed the ENTIRE real
+    content (table, declaration, signature, footer) fitting on page 1 with
+    room to spare, while page 2 was a phantom page containing nothing but
+    the repeating header logo and footer, i.e. purely this unclaimed
+    trailing-paragraph space pushed those last few blank paragraphs over.
+    """
+    half_points = str(int(round(pt_size.pt * 2)))
+    pPr = paragraph._p.get_or_add_pPr()
+    rPr = pPr.find(qn('w:rPr'))
+    if rPr is None:
+        rPr = OxmlElement('w:rPr')
+        pPr.append(rPr)
+    for tag in ('w:sz', 'w:szCs'):
+        el = rPr.find(qn(tag))
+        if el is None:
+            el = OxmlElement(tag)
+            rPr.append(el)
+        el.set(qn('w:val'), half_points)
+
+
 def _set_all_font_sizes(doc: "DocxDocument", pt_size: int) -> None:
     """Uniformly overwrites every run's font size — labels, headers and data
     alike — per the client's "shrink everything together" preference, EXCEPT
-    each document's title heading (see ONE_PAGE_TITLE_TEXTS), which is pinned
-    to ONE_PAGE_TITLE_PT instead so the document name stays readable no
-    matter how far the rest of the page has to shrink. Bold/italic/underline
-    and font family are untouched; only the size changes."""
+    the document title (ONE_PAGE_TITLE_TEXTS -> ONE_PAGE_TITLE_PT) and the
+    genuine bottom "HORIZON ENTERPRISE" name/address block
+    (ONE_PAGE_COMPANY_NAME_PT / ONE_PAGE_ADDRESS_PT), which stay pinned
+    regardless of how far the rest of the page has to shrink. Bold/italic/
+    underline and font family are untouched; only the size changes.
+
+    Also sets each paragraph's own end-of-paragraph mark size (see
+    _set_paragraph_mark_size) — needed so EMPTY paragraphs (no runs) shrink
+    along the same ladder instead of silently keeping their original size.
+
+    Two passes, in this order:
+    1. Company-name/address pin — restricted to
+       _iter_body_and_header_footer_paragraphs (NOT table cells; see that
+       function's docstring for why the table-cell lookalikes must be
+       excluded). Each pinned paragraph's underlying XML element id is
+       recorded so pass 2 skips it.
+    2. Title pin + default ladder size for everything else — uses
+       _iter_all_paragraphs (which DOES include table cells), since the
+       title itself legitimately lives inside a table cell in some
+       templates (e.g. ANX C.docx).
+    """
     size = Pt(pt_size)
     title_size = Pt(ONE_PAGE_TITLE_PT)
+    company_size = Pt(ONE_PAGE_COMPANY_NAME_PT)
+    address_size = Pt(ONE_PAGE_ADDRESS_PT)
+
+    # NOTE: track the actual `_p` XML elements themselves in this set (not
+    # id(paragraph._p)) — the Paragraph wrapper objects returned by each
+    # generator are transient, and once garbage-collected, Python is free to
+    # reuse their id() for the next unrelated object created during pass 2's
+    # iteration, causing false "already pinned" positives on paragraphs that
+    # were never actually pinned. Keeping the real elements here keeps them
+    # alive and makes membership checks reliable.
+    pinned_elements = set()
+    for paragraph in _iter_body_and_header_footer_paragraphs(doc):
+        text_upper = paragraph.text.strip().upper()
+        if text_upper in ONE_PAGE_COMPANY_NAME_TEXTS:
+            paragraph_fallback_size = company_size
+        elif _is_footer_address_paragraph(text_upper):
+            paragraph_fallback_size = address_size
+        else:
+            continue
+        pinned_elements.add(paragraph._p)
+        # Classify PER RUN, not uniformly for the whole paragraph: some
+        # templates (e.g. new_commercial_invoice1.docx) put "HORIZON
+        # ENTERPRISE" and the address in ONE paragraph joined by a manual
+        # line break rather than two separate paragraphs — paragraph.text
+        # then reads as "HORIZON ENTERPRISE\nE-802, Safal Parisar..." as one
+        # combined string, which contains "SAFAL PARISAR" and so classified
+        # the ENTIRE paragraph (company name included) as address-sized,
+        # which is the bug this fixes. Each run's OWN (line-break-stripped)
+        # text is checked independently first; a run that doesn't
+        # self-identify either way (e.g. a mid-address run split awkwardly
+        # across multiple runs) falls back to the whole-paragraph
+        # classification computed above, which is exactly the old,
+        # already-correct behavior for the single-line-per-paragraph
+        # templates (CHA TI/PL, Packing_List, PI FORMAT, ANX C).
+        for run in paragraph.runs:
+            run_text_upper = run.text.strip().upper()
+            if run_text_upper in ONE_PAGE_COMPANY_NAME_TEXTS:
+                run_size = company_size
+            elif _is_footer_address_paragraph(run_text_upper):
+                run_size = address_size
+            else:
+                run_size = paragraph_fallback_size
+            run.font.size = run_size
+        _set_paragraph_mark_size(paragraph, paragraph_fallback_size)
+
     for paragraph in _iter_all_paragraphs(doc):
-        run_size = title_size if paragraph.text.strip().upper() in ONE_PAGE_TITLE_TEXTS else size
+        if paragraph._p in pinned_elements:
+            continue
+        text_upper = paragraph.text.strip().upper()
+        run_size = title_size if text_upper in ONE_PAGE_TITLE_TEXTS else size
         for run in paragraph.runs:
             run.font.size = run_size
+        _set_paragraph_mark_size(paragraph, run_size)
 
 
 def _convert_to_pdf(docx_path: Path, out_dir: Path) -> Path:
@@ -195,14 +371,17 @@ def enforce_one_page(docx_path: Path, template_name: str) -> None:
     if template_name in ONE_PAGE_EXCLUDED_TEMPLATES:
         return
 
+    floor_pt = ONE_PAGE_TEMPLATE_MIN_PT_OVERRIDE.get(template_name, ONE_PAGE_MIN_PT)
+    size_ladder = [s for s in ONE_PAGE_SIZE_LADDER_PT if s >= floor_pt]
+
     with tempfile.TemporaryDirectory(prefix="one_page_check_") as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
         try:
             doc = DocxDocument(str(docx_path))
             row_height_snapshot = _snapshot_row_heights(doc)
-            for size_pt in ONE_PAGE_SIZE_LADDER_PT:
+            for size_pt in size_ladder:
                 _set_all_font_sizes(doc, size_pt)
-                _scale_row_heights(row_height_snapshot, size_pt / ONE_PAGE_DEFAULT_PT)
+                _scale_row_heights(row_height_snapshot, ONE_PAGE_ROW_HEIGHT_BASELINE_RATIO * (size_pt / ONE_PAGE_DEFAULT_PT))
                 doc.save(str(docx_path))
 
                 pdf_path = _convert_to_pdf(docx_path, tmp_dir)
@@ -213,7 +392,7 @@ def enforce_one_page(docx_path: Path, template_name: str) -> None:
                 if pages <= 1:
                     return
             logger.warning(
-                f"[one-page] {template_name} still {pages} page(s) at the {ONE_PAGE_MIN_PT}pt "
+                f"[one-page] {template_name} still {pages} page(s) at the {floor_pt}pt "
                 "floor — leaving as-is rather than shrinking further."
             )
         except Exception as e:
@@ -258,6 +437,14 @@ TEMPLATE_HSN_FIELD = {
     "CHA CI.docx":                 "hsn_code_india",
 }
 
+# "Normal" Commercial Invoice + Packing List print the shipment's original
+# PI invoice number + PI generation date as the Buyer's Order No. instead of
+# whatever's typed in CONTROL!C15 (e.g. "HE/2026-27/PI/060 DT. 01.07.2026").
+# Deliberately does NOT include CHA TI/PL/CI — those templates also
+# reference {{ buyers_order_no }} but keep printing the CONTROL!C15 value
+# as before; see the override block in build_context() below.
+BUYERS_ORDER_NO_PI_COMBO_TEMPLATES = {"new_commercial_invoice1.docx", "Packing_List.docx"}
+
 def sanitize_filename(name: str) -> str:
     return name.replace("/", "-").replace("\\", "-").replace(" ", "_")
 
@@ -265,14 +452,25 @@ def sanitize_filename(name: str) -> str:
 # conversion precision), everything else here is always a whole number in
 # practice (GST slabs are 0/5/12/18/28) so it gets rounded to an int so
 # templates never print "1500.0" or "18.0%".
-_MONEY_KEYS_TOP = (
+#
+# USD amounts use Western thousands-grouping (1,850 / 70,750) — that's the
+# correct convention for a $ figure on an export document. INR amounts must
+# use Indian digit grouping instead (last 3 digits together, then pairs of 2
+# — e.g. 6650500 -> "66,50,500", not the Western "6,650,500" they were
+# printing before) — every CHA/CI/PL/Tax Invoice template that shows a ₹
+# figure already has the ₹ symbol baked in as static template text right
+# before the placeholder, so the formatter itself only needs to produce the
+# grouped digits.
+_MONEY_KEYS_USD = (
     'unit_price_usd', 'fob_total_usd', 'freight_usd', 'insurance_usd', 'cif_total_usd',
-    'taxable_value_inr', 'igst_amount_inr', 'total_value_inr', 'total_inr',
-    'total_cif_usd', 'total_fob_usd', 'total_taxable_inr',
-    'igst_rate', 'igst_percent',
+    'total_cif_usd', 'total_fob_usd',
 )
-_MONEY_KEYS_ITEM = ('rate_per_unit', 'amount_usd', 'unit_price', 'total')
-_MONEY_KEYS_VEHICLE = ('unit_price_usd',)
+_MONEY_KEYS_INR = (
+    'taxable_value_inr', 'igst_amount_inr', 'total_value_inr', 'total_inr', 'total_taxable_inr',
+)
+_MONEY_KEYS_OTHER = ('igst_rate', 'igst_percent')  # percentages, not currency — never need grouping
+_MONEY_KEYS_ITEM = ('rate_per_unit', 'amount_usd', 'unit_price', 'total')  # always USD
+_MONEY_KEYS_VEHICLE = ('unit_price_usd',)  # always USD
 
 # Genuine rates/measurements — real decimals (e.g. 83.45 exchange rate, 600.5
 # kg) must survive untouched, but a value that happens to be a whole number
@@ -286,16 +484,47 @@ def _clean_rate(v):
     return int(v) if isinstance(v, float) and v == int(v) else v
 
 def _format_money(v):
-    """Whole-number USD/INR amount as a thousands-comma string (1850 -> '1,850').
-    Non-numeric values (already a string, None, etc.) pass through unchanged."""
+    """Whole-number USD amount as a Western thousands-comma string (1850 ->
+    '1,850'). Non-numeric values (already a string, None, etc.) pass through
+    unchanged."""
     if isinstance(v, bool):
         return v
     if isinstance(v, (int, float)):
         return f"{round(v):,}"
     return v
 
+def _format_money_indian(v):
+    """Whole-number INR amount using Indian digit grouping — last 3 digits
+    together, then pairs of 2 from there (6650500 -> '66,50,500'). Mirrors
+    the client-approved formatIndianPrice() grouping rule. Non-numeric
+    values pass through unchanged, same as _format_money."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        n = round(v)
+        digits = str(abs(n))
+        if len(digits) <= 3:
+            grouped = digits
+        else:
+            last_three, rest = digits[-3:], digits[:-3]
+            pairs = []
+            while len(rest) > 2:
+                pairs.insert(0, rest[-2:])
+                rest = rest[:-2]
+            if rest:
+                pairs.insert(0, rest)
+            grouped = ','.join(pairs) + ',' + last_three
+        return ('-' if n < 0 else '') + grouped
+    return v
+
 def _round_money(context: Dict[str, Any]) -> None:
-    for key in _MONEY_KEYS_TOP:
+    for key in _MONEY_KEYS_USD:
+        if key in context:
+            context[key] = _format_money(context[key])
+    for key in _MONEY_KEYS_INR:
+        if key in context:
+            context[key] = _format_money_indian(context[key])
+    for key in _MONEY_KEYS_OTHER:
         if key in context:
             context[key] = _format_money(context[key])
     for key in _RATE_KEYS_TOP:
@@ -437,6 +666,27 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
         for it in context['items']:
             if isinstance(it, dict) and it.get(hsn_field):
                 it['hsn_code'] = it[hsn_field]
+
+    # ── Buyer's Order No. override — PI number + PI date (CI/PL only) ──────
+    # See BUYERS_ORDER_NO_PI_COMBO_TEMPLATES above. Resolved from vehicles[],
+    # same source (and same "first vehicle with a non-blank pi_invoice_no
+    # wins" rule) as script.gs's buildPayload() uses for its own resolved-PI
+    # values — every vehicle on a shipment was assigned together, so the
+    # first non-blank hit is authoritative. Falls back to leaving
+    # buyers_order_no untouched (whatever CONTROL!C15 sent) if this shipment
+    # never had a PROFORMA stage recorded on any vehicle.
+    if template_name in BUYERS_ORDER_NO_PI_COMBO_TEMPLATES and isinstance(context.get('vehicles'), list):
+        pi_invoice_no = ''
+        pi_invoice_date = ''
+        for v in context['vehicles']:
+            if isinstance(v, dict) and v.get('pi_invoice_no'):
+                pi_invoice_no = v['pi_invoice_no']
+                pi_invoice_date = v.get('pi_invoice_date', '')
+                break
+        if pi_invoice_no:
+            # No "DT." label — just the PI number, two spaces, then the date
+            # (e.g. "HE/2026-27/PI/060  09.08.2026"), per client request.
+            context['buyers_order_no'] = f"{pi_invoice_no}  {pi_invoice_date}" if pi_invoice_date else pi_invoice_no
 
     # ── Add aliases + sr_no + unit + package range on each item ────────────
     _running_item = 0

@@ -843,9 +843,13 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
                 pi_invoice_date = v.get('pi_invoice_date', '')
                 break
         if pi_invoice_no:
-            # No "DT." label — just the PI number, two spaces, then the date
-            # (e.g. "HE/2026-27/PI/060  09.08.2026"), per client request.
-            context['buyers_order_no'] = f"{pi_invoice_no}  {pi_invoice_date}" if pi_invoice_date else pi_invoice_no
+            # No "DT." label — just the PI number, then the date on its own
+            # line below (e.g. "HE/2026-27/PI/060" / "09.08.2026"), matching
+            # the two-line look of the adjacent "INVOICE NO. & DATE" cell.
+            # docxtpl's resolve_listing() turns a literal "\n" in a rendered
+            # value into a real <w:br/>, so this "\n" becomes an actual line
+            # break in the output, not just a source-code newline.
+            context['buyers_order_no'] = f"{pi_invoice_no}\n{pi_invoice_date}" if pi_invoice_date else pi_invoice_no
 
     # ── Add aliases + sr_no + unit + package range on each item ────────────
     _running_item = 0

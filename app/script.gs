@@ -481,14 +481,12 @@
   ];
 
   // Annexure C item 15 "Vehicles" — one column right after the read-only
-  // preview block (col L). Unlike DESC_PREVIEW_FIELDS_ above, this column is
-  // NOT overwritten on every generation: writeDescriptionPreview_ only fills
-  // it in the FIRST time (when blank), auto-computed as the distinct vehicle
-  // models assigned to the invoice, comma-separated. Once it has any text —
-  // auto-filled or hand-typed — that text sticks permanently and is what
-  // actually gets sent to Annexure C's point 15, so you can edit it here any
-  // time and future generations will keep using your edit instead of
-  // recomputing it.
+  // preview block (col L). Same "overwritten every generation" behavior as
+  // DESC_PREVIEW_FIELDS_ above (used to be sticky/first-write-only, but that
+  // meant editing Products!T after an invoice's first generation had no
+  // effect — client wants this column to always reflect the CURRENT
+  // Products!T text, so it's recomputed fresh from the distinct vehicle
+  // models' Products!T descriptions on every single generation run instead.
   var ANX_C_VEHICLES_COL_ = DESC_PREVIEW_COL_START_ + DESC_PREVIEW_HEADERS_.length;  // col L, 1-based
 
   function ensureDescriptionPreviewHeaders_(sheet) {
@@ -505,7 +503,7 @@
     if (!String(anxCHeaderCell.getValue() || '').trim()) {
       anxCHeaderCell.setValue('Generated: Anx C').setFontWeight('bold').setBackground('#0d9488').setFontColor('#ffffff');
       sheet.getRange(2, ANX_C_VEHICLES_COL_).setValue(
-        'ANNEXURE C ITEM 15 (Vehicles) — auto-filled once with the distinct vehicle models, comma-separated. Edit this cell any time; your edit sticks and is used for point 15 on every future generation instead of being recomputed.');
+        'ANNEXURE C ITEM 15 (Vehicles) — read-only, recomputed from Products!T (ANX C Description) for the distinct vehicle models on every generation. Edit Products!T to change what prints here, not this cell directly — it gets overwritten on the next generation.');
     }
   }
 
@@ -533,12 +531,13 @@
   // whichever number is active THIS run would create a second, duplicate row
   // once the shipment moves to its other stage. So this matches (and then
   // backfills) on EITHER number, consolidating both stages into one row.
-  // anxCVehiclesDefault: the auto-computed distinct-model comma list to seed
-  // column L with the first time this invoice's row is touched. Returns the
-  // FINAL resolved value for that column — whatever's already in the cell if
-  // non-blank (a prior auto-fill or a hand-edit, either way it sticks), else
-  // the freshly-written default — so the caller can feed it straight into the
-  // payload without duplicating this sheet-read logic.
+  // anxCVehiclesDefault: the freshly-computed distinct-model comma list
+  // (from each item's current Products!T text) — written into column L on
+  // EVERY call, same as every other DESC_PREVIEW_FIELDS_ column, so a
+  // Products!T edit shows up in Annexure C the next time this invoice is
+  // generated instead of being stuck on whatever was computed the first
+  // time. Returns that same value so the caller can feed it straight into
+  // the payload without duplicating this sheet-read logic.
   function writeDescriptionPreview_(ss, invoiceNo, piInvoiceNo, items, anxCVehiclesDefault) {
     if (!items || items.length === 0) return anxCVehiclesDefault || '';
     if (!invoiceNo && !piInvoiceNo) return anxCVehiclesDefault || '';
@@ -571,14 +570,11 @@
     var rowValues = DESC_PREVIEW_FIELDS_.map(function(f) { return joinItemsField_(items, f); });
     sheet.getRange(targetRow, DESC_PREVIEW_COL_START_, 1, rowValues.length).setValues([rowValues]);
 
-    // Col L (Annexure C vehicles) — sticky, unlike the columns above: only
-    // written when blank, and whatever ends up there (default or hand-edited)
-    // is returned as-is for use in the payload.
-    var anxCCell = sheet.getRange(targetRow, ANX_C_VEHICLES_COL_);
-    var anxCExisting = String(anxCCell.getValue() || '').trim();
-    if (anxCExisting) return anxCExisting;
+    // Col L (Annexure C vehicles) — overwritten every run now, same as the
+    // columns above, so it always reflects the CURRENT Products!T text
+    // instead of freezing on whatever was computed the first time.
     var anxCDefault = anxCVehiclesDefault || '';
-    if (anxCDefault) anxCCell.setValue(anxCDefault);
+    sheet.getRange(targetRow, ANX_C_VEHICLES_COL_).setValue(anxCDefault);
     return anxCDefault;
   }
 
@@ -2092,14 +2088,13 @@
       if (!previewPiInvoiceNo) previewPiInvoiceNo = String(rawMatchedRows[pmi][12] || '').trim();
       if (previewInvoiceNo && previewPiInvoiceNo) break;
     }
-    // Default for Annexure C item 15 (Vehicles) — each distinct model's
+    // Annexure C item 15 (Vehicles) — each distinct model's CURRENT
     // Products!T ("ANX C Description") text (falls back to the plain model
     // name per-item if that column's blank for a given product — see
     // descAnxC above), comma-separated, one entry per model group actually
     // assigned to this invoice (post C17-selection; `items` is already
     // deduplicated at the model level, so no separate dedup needed here).
-    // Only ever used the FIRST time this invoice's row gets touched — see
-    // writeDescriptionPreview_'s sticky-column-L handling above.
+    // Recomputed on every generation — see writeDescriptionPreview_.
     var anxCVehiclesDefault = items
       .map(function(it) { return String(it.description_anx_c || '').trim(); })
       .filter(Boolean)

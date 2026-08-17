@@ -23,34 +23,54 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 BASE_DOWNLOAD_URL = os.getenv("BASE_DOWNLOAD_URL", "http://localhost:8080/output").rstrip("/")
 
 # ── One-page enforcement ─────────────────────────────────────────────────────
-# Every generated document except DBK gets forced onto a single page: start
-# at ONE_PAGE_DEFAULT_PT (the client's requested default), and if it still
-# overflows, uniformly shrink every run's font size down through
-# ONE_PAGE_SIZE_LADDER_PT until either it fits on one page or the floor
-# (ONE_PAGE_MIN_PT) is reached — at the floor we accept whatever overflow is
-# left rather than shrink further into illegibility. "Fits" is verified for
-# real (not guessed) by round-tripping through LibreOffice headless to PDF
-# and counting actual pages — python-docx has no layout engine of its own,
-# so there is no way to know how many pages a .docx will render to without
-# actually rendering it.
+# Every generated document except DBK MUST render to exactly one page —
+# client requirement, no exceptions. Starting at ONE_PAGE_DEFAULT_PT, font
+# size is dynamically searched downward in ONE_PAGE_STEP_PT increments (not a
+# handful of fixed named sizes) until the document actually fits, all the way
+# down to ONE_PAGE_MIN_PT if that's what it genuinely takes — unlike the
+# fixed 5-step ladder this replaces, there is no per-template floor that can
+# leave a heavy shipment stuck on 2 pages. ONE_PAGE_MIN_PT is deliberately
+# still comfortably legible (6pt is small but readable), not a token
+# stopping point — going lower than that stops helping in practice (row/cell
+# padding and fixed-size elements like the logo start to dominate the page
+# long before individual characters would become unreadable), so a document
+# that still doesn't fit at 6pt is accepted as a genuine, exceptional
+# overflow rather than pushed into truly illegible territory.
+#
+# "Fits" is verified for real (not guessed) by round-tripping through
+# LibreOffice headless to PDF and counting actual pages on every single step
+# — python-docx has no layout engine of its own, so there is no way to know
+# how many pages a .docx will render to without actually rendering it.
 ONE_PAGE_EXCLUDED_TEMPLATES = {"DBK_Declaration.docx"}
-ONE_PAGE_DEFAULT_PT = 11
-ONE_PAGE_MIN_PT = 7
-ONE_PAGE_SIZE_LADDER_PT = [11, 10, 9, 8, 7]
+ONE_PAGE_DEFAULT_PT = 11.0
+ONE_PAGE_MIN_PT = 6.0
+ONE_PAGE_STEP_PT = 0.5
 ONE_PAGE_SOFFICE_TIMEOUT_SEC = 60
 
-# Commercial Invoice and Packing List floor at 10pt, not the full
-# ONE_PAGE_SIZE_LADDER_PT ladder down to ONE_PAGE_MIN_PT — client wants 11pt
-# whenever it fits, and is willing to drop ONE step to 10pt (still clearly
-# readable) rather than spill to a second page, but no further than that
-# (confirmed via reproduction: a genuine heavy shipment, e.g. 3 item rows
-# with a full CI trailer block, needs down to 7-8pt to fit on one page,
-# which was too small to read — 10pt is the accepted compromise floor).
-# Every other template keeps the full ONE_PAGE_SIZE_LADDER_PT ladder down to
-# ONE_PAGE_MIN_PT.
-ONE_PAGE_TEMPLATE_MIN_PT_OVERRIDE = {
-    "new_commercial_invoice1.docx": 10,
-    "Packing_List.docx": 10,
+
+def _one_page_size_ladder(ceiling_pt: float, floor_pt: float) -> list:
+    """Every font size to try, largest first, from ceiling_pt down to
+    floor_pt in ONE_PAGE_STEP_PT increments — the dynamic replacement for a
+    fixed handful of named sizes. Always includes floor_pt itself even if it
+    doesn't land exactly on a step boundary, so the true floor is always the
+    last-resort attempt regardless of the ceiling/step combination."""
+    sizes = []
+    size = ceiling_pt
+    while size > floor_pt:
+        sizes.append(round(size, 1))
+        size -= ONE_PAGE_STEP_PT
+    sizes.append(round(floor_pt, 1))
+    return sizes
+
+# ANX C has enough real content (Annexure C's 15 fixed line items, each with
+# its own row) that 11pt/10.5pt almost always overflow to a 2nd page anyway —
+# confirmed by reproduction. Starting its search at 10pt instead just skips
+# those two known-futile attempts (each one costs a real LibreOffice
+# round-trip, ~2s) — a pure performance optimization, not a correctness
+# floor/ceiling; it still searches all the way down to ONE_PAGE_MIN_PT like
+# every other template if it ever needs to.
+ONE_PAGE_TEMPLATE_MAX_PT_OVERRIDE = {
+    "ANX C.docx": 10.0,
 }
 
 # Applied to every "at least" row height on EVERY ladder step, including the
@@ -92,6 +112,16 @@ ONE_PAGE_COMPANY_NAME_PT = 14
 ONE_PAGE_COMPANY_NAME_TEXTS = {"HORIZON ENTERPRISE"}
 ONE_PAGE_ADDRESS_PT = 12
 
+# The "AMOUNT CHARGEABLE..." words-in-full line (e.g. CHA TI's "AMOUNT
+# CHARGEABLE INR: Rupees Seventy Eight Lakh...Only") is long enough that the
+# uniform ladder size (11pt default) wraps it onto two lines — the template
+# already had this line hand-set to 10pt specifically so it fits on one line,
+# but that got silently overwritten back to the uniform size on every
+# generation since nothing exempted it from the shrink-everything-together
+# pass. Pinned the same way as the title/company/address blocks above so it
+# stays at 10pt regardless of what the rest of the page is doing.
+ONE_PAGE_AMOUNT_CHARGEABLE_PT = 10
+
 
 def _is_footer_address_paragraph(text_upper: str) -> bool:
     return (
@@ -100,6 +130,10 @@ def _is_footer_address_paragraph(text_upper: str) -> bool:
         or text_upper.startswith("EMAIL:") or text_upper.startswith("EMAIL :")
         or "WEBSITE:" in text_upper
     )
+
+
+def _is_amount_chargeable_paragraph(text_upper: str) -> bool:
+    return text_upper.startswith("AMOUNT CHARGEABLE")
 
 
 def _iter_table_paragraphs(table):
@@ -207,6 +241,38 @@ def _scale_row_heights(snapshot, ratio: float) -> None:
         row.height = Length(max(1, round(original_emu * ratio)))
 
 
+# Page margins are pure whitespace — unlike row height minimums (which
+# protect real content that might need more room) or the pinned title/
+# company/address sizes (which are a deliberate client requirement), there
+# is nothing a shrunk top/bottom margin could ever clip, so this is safe to
+# push much harder than the row-height ratio. Confirmed necessary by direct
+# reproduction: a heavy Packing List (3 models, 8 vehicles, full chassis
+# breakdown) still had the pinned "HORIZON ENTERPRISE" footer block spill a
+# single line onto an otherwise-blank 2nd page even at the font-size floor
+# with row heights fully reclaimed — shrinking top/bottom margins closed
+# nearly all of that gap on its own. ONE_PAGE_MARGIN_FLOOR_PT keeps a small
+# amount of real margin rather than going to 0 (which some renderers clamp
+# to their own minimum anyway, making a literal 0 no more effective than a
+# small positive value while looking broken if a viewer doesn't clamp it).
+ONE_PAGE_MARGIN_FLOOR_PT = 10.0
+
+
+def _snapshot_margins(doc: "DocxDocument"):
+    """Captures every section's original top/bottom margin once, before any
+    ladder step touches it — mirrors _snapshot_row_heights above."""
+    return [(section, section.top_margin, section.bottom_margin) for section in doc.sections]
+
+
+def _scale_margins(snapshot, ratio: float) -> None:
+    """Rewrites every snapshotted section's top/bottom margin to `ratio` of
+    its original value, never going below ONE_PAGE_MARGIN_FLOOR_PT — absolute,
+    not cumulative, so safe to call again on every ladder step."""
+    floor = Pt(ONE_PAGE_MARGIN_FLOOR_PT)
+    for section, original_top, original_bottom in snapshot:
+        section.top_margin = max(floor, Length(round(original_top * ratio)))
+        section.bottom_margin = max(floor, Length(round(original_bottom * ratio)))
+
+
 def _set_paragraph_mark_size(paragraph, pt_size: "Pt") -> None:
     """Sets the font size of a paragraph's own end-of-paragraph mark (the
     'rPr' nested inside 'pPr') — this is what determines the line height of
@@ -243,14 +309,24 @@ def _set_paragraph_mark_size(paragraph, pt_size: "Pt") -> None:
         el.set(qn('w:val'), half_points)
 
 
-def _set_all_font_sizes(doc: "DocxDocument", pt_size: int) -> None:
+def _set_all_font_sizes(doc: "DocxDocument", pt_size: float, pin_special_text: bool = True, amount_chargeable_pt: float = None) -> None:
     """Uniformly overwrites every run's font size — labels, headers and data
     alike — per the client's "shrink everything together" preference, EXCEPT
     the document title (ONE_PAGE_TITLE_TEXTS -> ONE_PAGE_TITLE_PT) and the
     genuine bottom "HORIZON ENTERPRISE" name/address block
     (ONE_PAGE_COMPANY_NAME_PT / ONE_PAGE_ADDRESS_PT), which stay pinned
-    regardless of how far the rest of the page has to shrink. Bold/italic/
-    underline and font family are untouched; only the size changes.
+    regardless of how far the rest of the page has to shrink — UNLESS
+    pin_special_text=False, in which case those get uniformly sized like
+    everything else too. That override exists purely as enforce_one_page's
+    absolute last resort: on rare, content-heavy documents even font size +
+    row-height + margin reclaiming all the way to their respective floors
+    still isn't enough (confirmed by direct reproduction — a heavy Packing
+    List still had the pinned footer alone spill a line onto page 2 with
+    every other lever already maxed out), and a client requirement of
+    "always one page" has to take priority over the title/footer pin in that
+    rare case — every document that fits with the pin honored never reaches
+    this parameter at all. Bold/italic/underline and font family are
+    untouched either way; only the size changes.
 
     Also sets each paragraph's own end-of-paragraph mark size (see
     _set_paragraph_mark_size) — needed so EMPTY paragraphs (no runs) shrink
@@ -268,9 +344,10 @@ def _set_all_font_sizes(doc: "DocxDocument", pt_size: int) -> None:
        templates (e.g. ANX C.docx).
     """
     size = Pt(pt_size)
-    title_size = Pt(ONE_PAGE_TITLE_PT)
-    company_size = Pt(ONE_PAGE_COMPANY_NAME_PT)
-    address_size = Pt(ONE_PAGE_ADDRESS_PT)
+    title_size = size if not pin_special_text else Pt(ONE_PAGE_TITLE_PT)
+    company_size = size if not pin_special_text else Pt(ONE_PAGE_COMPANY_NAME_PT)
+    address_size = size if not pin_special_text else Pt(ONE_PAGE_ADDRESS_PT)
+    amount_chargeable_size = size if not pin_special_text else Pt(amount_chargeable_pt if amount_chargeable_pt is not None else ONE_PAGE_AMOUNT_CHARGEABLE_PT)
 
     # NOTE: track the actual `_p` XML elements themselves in this set (not
     # id(paragraph._p)) — the Paragraph wrapper objects returned by each
@@ -280,7 +357,7 @@ def _set_all_font_sizes(doc: "DocxDocument", pt_size: int) -> None:
     # were never actually pinned. Keeping the real elements here keeps them
     # alive and makes membership checks reliable.
     pinned_elements = set()
-    for paragraph in _iter_body_and_header_footer_paragraphs(doc):
+    for paragraph in (_iter_body_and_header_footer_paragraphs(doc) if pin_special_text else []):
         text_upper = paragraph.text.strip().upper()
         if text_upper in ONE_PAGE_COMPANY_NAME_TEXTS:
             paragraph_fallback_size = company_size
@@ -318,7 +395,12 @@ def _set_all_font_sizes(doc: "DocxDocument", pt_size: int) -> None:
         if paragraph._p in pinned_elements:
             continue
         text_upper = paragraph.text.strip().upper()
-        run_size = title_size if text_upper in ONE_PAGE_TITLE_TEXTS else size
+        if text_upper in ONE_PAGE_TITLE_TEXTS:
+            run_size = title_size
+        elif _is_amount_chargeable_paragraph(text_upper):
+            run_size = amount_chargeable_size
+        else:
+            run_size = size
         for run in paragraph.runs:
             run.font.size = run_size
         _set_paragraph_mark_size(paragraph, run_size)
@@ -361,6 +443,52 @@ def _count_pdf_pages(pdf_path: Path) -> int:
     raise RuntimeError(f"pdfinfo output for {pdf_path} had no 'Pages:' line")
 
 
+def _amount_chargeable_is_one_line(pdf_path: Path) -> bool:
+    """True if the rendered "AMOUNT CHARGEABLE..." line fits on a single
+    visual line rather than wrapping — checked for real via the actual PDF
+    text layout (pdftotext -layout), not guessed. The sentence always ends
+    in "...Only" (see convert_to_words / script.gs's AMOUNTWORDS), so a line
+    that starts with "AMOUNT CHARGEABLE" and also ends with "Only" hasn't
+    wrapped; if it wrapped, that first visual line would end mid-sentence
+    and "Only" would appear at the start of the NEXT line instead."""
+    result = subprocess.run(
+        ["pdftotext", "-layout", str(pdf_path), "-"], check=True, capture_output=True, text=True,
+        timeout=ONE_PAGE_SOFFICE_TIMEOUT_SEC,
+    )
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("AMOUNT CHARGEABLE"):
+            return stripped.rstrip(".").split()[-1].upper() == "ONLY"
+    return True  # line not found at all (template variant without it) — nothing to fix
+
+
+def _fit_amount_chargeable_one_line(doc: "DocxDocument", docx_path: Path, tmp_dir: Path, template_name: str, body_size_pt: float) -> None:
+    """Runs once, after the main page-fit ladder has already settled on one
+    page at body_size_pt — a small dedicated search that shrinks ONLY the
+    "AMOUNT CHARGEABLE..." pin (starting at ONE_PAGE_AMOUNT_CHARGEABLE_PT)
+    down in 0.5pt steps until that line fits on one visual line instead of
+    wrapping, verified for real via the rendered PDF at every step, same
+    rigor as the main page-fit ladder. body_size_pt (whatever size the main
+    ladder actually settled on) is re-applied on every step so the rest of
+    the page stays exactly as the main ladder left it — this never mutates
+    the module-level ONE_PAGE_AMOUNT_CHARGEABLE_PT default, only what's
+    written into this one document. Gives up at ONE_PAGE_MIN_PT (same floor
+    as the main ladder) if it never manages to fit, leaving the line at
+    whatever size it last tried.
+    """
+    for size_pt in _one_page_size_ladder(ONE_PAGE_AMOUNT_CHARGEABLE_PT, ONE_PAGE_MIN_PT):
+        _set_all_font_sizes(doc, body_size_pt, amount_chargeable_pt=size_pt)
+        doc.save(str(docx_path))
+
+        pdf_path = _convert_to_pdf(docx_path, tmp_dir)
+        one_line = _amount_chargeable_is_one_line(pdf_path)
+        pdf_path.unlink(missing_ok=True)
+
+        logger.info(f"[amount-chargeable] {template_name} @ {size_pt}pt -> {'one line' if one_line else 'wrapped'}")
+        if one_line:
+            return
+
+
 def enforce_one_page(docx_path: Path, template_name: str) -> None:
     """Mutates the saved .docx in place so it renders to one page, per the
     client's request — skipped entirely for DBK (see
@@ -373,17 +501,21 @@ def enforce_one_page(docx_path: Path, template_name: str) -> None:
     if template_name in ONE_PAGE_EXCLUDED_TEMPLATES:
         return
 
-    floor_pt = ONE_PAGE_TEMPLATE_MIN_PT_OVERRIDE.get(template_name, ONE_PAGE_MIN_PT)
-    size_ladder = [s for s in ONE_PAGE_SIZE_LADDER_PT if s >= floor_pt]
+    floor_pt = ONE_PAGE_MIN_PT
+    ceiling_pt = ONE_PAGE_TEMPLATE_MAX_PT_OVERRIDE.get(template_name, ONE_PAGE_DEFAULT_PT)
+    size_ladder = _one_page_size_ladder(ceiling_pt, floor_pt)
 
     with tempfile.TemporaryDirectory(prefix="one_page_check_") as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
         try:
             doc = DocxDocument(str(docx_path))
             row_height_snapshot = _snapshot_row_heights(doc)
+            margin_snapshot = _snapshot_margins(doc)
             for size_pt in size_ladder:
                 _set_all_font_sizes(doc, size_pt)
-                _scale_row_heights(row_height_snapshot, ONE_PAGE_ROW_HEIGHT_BASELINE_RATIO * (size_pt / ONE_PAGE_DEFAULT_PT))
+                ratio = ONE_PAGE_ROW_HEIGHT_BASELINE_RATIO * (size_pt / ONE_PAGE_DEFAULT_PT)
+                _scale_row_heights(row_height_snapshot, ratio)
+                _scale_margins(margin_snapshot, ratio)
                 doc.save(str(docx_path))
 
                 pdf_path = _convert_to_pdf(docx_path, tmp_dir)
@@ -392,10 +524,35 @@ def enforce_one_page(docx_path: Path, template_name: str) -> None:
 
                 logger.info(f"[one-page] {template_name} @ {size_pt}pt -> {pages} page(s)")
                 if pages <= 1:
+                    _fit_amount_chargeable_one_line(doc, docx_path, tmp_dir, template_name, size_pt)
                     return
+
+            # Absolute last resort: the whole ladder ran at the floor font
+            # size with row heights and margins both fully reclaimed, and it
+            # STILL doesn't fit — confirmed by direct reproduction to happen
+            # on genuinely heavy documents (many models/vehicles) where even
+            # 6pt body text isn't enough, because the pinned title/company/
+            # address block doesn't shrink with the rest of the page. "Always
+            # one page" wins over the pin at this point — try once more at
+            # the floor size with the pin itself lifted.
             logger.warning(
                 f"[one-page] {template_name} still {pages} page(s) at the {floor_pt}pt "
-                "floor — leaving as-is rather than shrinking further."
+                "floor with row heights/margins fully reclaimed — trying one "
+                "final pass with the title/company/address size pin lifted."
+            )
+            _set_all_font_sizes(doc, floor_pt, pin_special_text=False)
+            doc.save(str(docx_path))
+            pdf_path = _convert_to_pdf(docx_path, tmp_dir)
+            pages = _count_pdf_pages(pdf_path)
+            pdf_path.unlink(missing_ok=True)
+            logger.info(f"[one-page] {template_name} @ {floor_pt}pt (pin lifted) -> {pages} page(s)")
+            if pages <= 1:
+                return
+            logger.error(
+                f"[one-page] {template_name} still {pages} page(s) even with every lever "
+                "(font size, row heights, margins, title/footer pin) fully exhausted — "
+                "leaving as-is. This document's real content genuinely exceeds one page "
+                f"at {floor_pt}pt; only trimming actual content can fix it further."
             )
         except Exception as e:
             logger.error(f"[one-page] {template_name} enforcement failed, leaving document as rendered: {e}", exc_info=True)

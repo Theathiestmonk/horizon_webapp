@@ -40,6 +40,7 @@
     termsOfPaymentCell: 'C23',   // CONTROL C23 = payment terms (e.g. "CIF, 100% TT ADVANCE")
     notifyCell1:        'C14',
     notifyCell2:        'C15',
+    notify2Cell:        'F14',  // NEW — NOTIFY 2 for templates (merged F:H)
     stockTabCell:       'C19',  // dropdown: which monthly Stock_YYYY_MM tab this invoice pulls vehicles from
     // NEW — section 10 "CUSTOMS / DESTINATION COMPLIANCE" (row 56-58), for the
     // Commercial Invoice / CHA CI/TI generated description block. All optional
@@ -68,17 +69,16 @@
     // fixed per-model property, so it moved off the Products tab onto its own
     // CONTROL cell here rather than being read via genProd[19] anymore.
     invoiceCodeCell:        'F17',
-    webhookUrl: 'https://webshots-filme-pipes-legends.trycloudflare.com/api/v1/invoices/',
+    webhookEnvironment: 'production', // Set to 'local' for testing against Cloudflare Tunnel; 'production' for live.
+    webhookUrl: 'https://horizon-webapp.onrender.com/api/v1/invoices/',
+    localWebhookUrl: 'https://stage-compiled-six-attending.trycloudflare.com/api/v1/invoices/',
   };
 
-  // A stray leading/trailing space pasted alongside a new Cloudflare tunnel
-  // URL (easy to do — copy-pasting from a terminal or chat often carries one)
-  // makes UrlFetchApp.fetch throw "Invalid argument: %20https://..." since the
-  // leading space gets URL-encoded into the request. Every generate*()
-  // function below should read the webcook base through this instead of
-  // CFG.webhookUrl directly, so a stray space next time doesn't break generation.
+  // Every request uses one selected base URL, trimmed to avoid whitespace
+  // pasted into either endpoint breaking UrlFetchApp.fetch.
   function webhookBase_() {
-    return String(CFG.webhookUrl || '').trim();
+    var url = CFG.webhookEnvironment === 'local' ? CFG.localWebhookUrl : CFG.webhookUrl;
+    return String(url || '').trim();
   }
 
   // ── Descriptions (per-model) ────────────────────────────────────────────────
@@ -274,7 +274,13 @@
   var STOCK_PI_DATE_COL_ = 21;  // col U, 1-based
   var STOCK_PI_DATE_HEADERS_ = ['pi_invoice_date'];
 
-  // Ensures columns N-Q, R-T and U have their header labels in row 3 — safe
+  // Per-vehicle IGST rate, col V. Each vehicle can have its own IGST rate
+  // instead of using a single rate for the whole invoice. Dropdown references
+  // Lookups!F29 range (same as CONTROL!F29). Falls back to CONTROL!F29 when blank.
+  var STOCK_IGST_COL_ = 22;  // col V, 1-based
+  var STOCK_IGST_HEADERS_ = ['igst_rate'];
+
+  // Ensures columns N-Q, R-T, U and V have their header labels in row 3 — safe
   // to call repeatedly, only ever touches header cells that are currently blank.
   function ensureStockExtraColumns_(sheet) {
     function fillIfNeeded(startCol, headers) {
@@ -288,6 +294,7 @@
     fillIfNeeded(STOCK_EXTRA_COL_START_, STOCK_EXTRA_HEADERS_);
     fillIfNeeded(STOCK_HSN_COL_START_, STOCK_HSN_HEADERS_);
     fillIfNeeded(STOCK_PI_DATE_COL_, STOCK_PI_DATE_HEADERS_);
+    fillIfNeeded(STOCK_IGST_COL_, STOCK_IGST_HEADERS_);
   }
 
   // Backfills columns O-R and S-U onto every Stock tab that already exists —
@@ -798,9 +805,15 @@
       if (x < 20)       return ones[x] || '';
       if (x < 100)      return tens[Math.floor(x/10)] + (x%10 ? ' '+ones[x%10] : '');
       if (x < 1000)     return ones[Math.floor(x/100)] + ' Hundred' + (x%100 ? ' And '+words(x%100) : '');
-      if (x < 100000)   return words(Math.floor(x/1000)) + ' Thousand' + (x%1000 ? ' '+words(x%1000) : '');
-      if (x < 10000000) return words(Math.floor(x/100000)) + ' Lakh' + (x%100000 ? ' '+words(x%100000) : '');
-      return words(Math.floor(x/10000000)) + ' Crore' + (x%10000000 ? ' '+words(x%10000000) : '');
+      if (curr === 'INR') {
+        if (x < 100000)   return words(Math.floor(x/1000)) + ' Thousand' + (x%1000 ? ' '+words(x%1000) : '');
+        if (x < 10000000) return words(Math.floor(x/100000)) + ' Lakh' + (x%100000 ? ' '+words(x%100000) : '');
+        return words(Math.floor(x/10000000)) + ' Crore' + (x%10000000 ? ' '+words(x%10000000) : '');
+      }
+      if (x < 1000000)    return words(Math.floor(x/1000)) + ' Thousand' + (x%1000 ? ' '+words(x%1000) : '');
+      if (x < 1000000000) return words(Math.floor(x/1000000)) + ' Million' + (x%1000000 ? ' '+words(x%1000000) : '');
+      if (x < 1000000000000) return words(Math.floor(x/1000000000)) + ' Billion' + (x%1000000000 ? ' '+words(x%1000000000) : '');
+      return words(Math.floor(x/1000000000000)) + ' Trillion' + (x%1000000000000 ? ' '+words(x%1000000000000) : '');
     }
     const whole = Math.floor(Math.abs(n));
     const cents = Math.round((Math.abs(n) - whole) * 100);
@@ -998,6 +1011,7 @@
     refreshStockTabDropdown_(ss);
     ensureCustomsFieldsLabels_(ss);
     ensureStockExtraColumnsAllTabs_(ss);
+    ensureIgstDropdownAllTabs_(ss);  // Apply IGST rate dropdown to Stock tabs
     ensureProductsExtraColumns_(ss);
     ensureCustomerSmartDropdownColumn_(ss);
     ensureLookupDropdowns_(ss);
@@ -1682,7 +1696,7 @@
     // in place, which a plain .filter() would lose track of.
     let rawMatchedRows = [];
     let matchedRowNumbers = [];
-    stock.getRange('A4:U2000').getValues().forEach(function(r, idx) {
+    stock.getRange('A4:V2000').getValues().forEach(function(r, idx) {
       if (rowMatchesInvoice_(r, inv)) {
         rawMatchedRows.push(r);
         matchedRowNumbers.push(idx + 4);
@@ -1720,7 +1734,10 @@
           // optional, resolved into each item's hsn_code_* fields below.
           hsn_code_user_country: String(r[17] || '').trim(),
           hsn_code_india:        String(r[18] || '').trim(),
-          hsn_code_pi:           String(r[19] || '').trim()
+          hsn_code_pi:           String(r[19] || '').trim(),
+          // Per-vehicle IGST rate (col V, see STOCK_IGST_HEADERS_) — optional,
+          // falls back to CONTROL!F29 if blank.
+          igst_rate:             Number(r[21]) || 0
         };
       });
 
@@ -2174,7 +2191,7 @@
         insurance_usd:     Number(ctrl.getRange('H27').getValue()) || 0,
         cif_total_usd:     cif_usd,
         exchange_rate:     Number(ctrl.getRange(CFG.exchangeRateCell).getValue()) || 0,
-        igst_rate:         Number(ctrl.getRange(CFG.igstRateCell).getValue()) || 0,
+        igst_rate:         calculateWeightedIgstRate_(vehicles) || Number(ctrl.getRange(CFG.igstRateCell).getValue()) || 0,
         taxable_value_inr: Number(ctrl.getRange(CFG.taxableValueCell).getValue()) || 0,
         igst_amount_inr:   Number(ctrl.getRange(CFG.igstAmountCell).getValue()) || 0,
         total_value_inr:   total_inr
@@ -2203,7 +2220,7 @@
       // only falls back to the full buyer name/address/country blob when this
       // is blank, so filling it in always wins.
       notify_1:              String(ctrl.getRange(CFG.notifyCell1).getValue() || ''),
-      notify_2:              '',  // Null for backend to populate; client fills manually in doc if needed
+      notify_2:              String(ctrl.getRange(CFG.notify2Cell).getValue() || ''),
       terms_of_payment:      String(ctrl.getRange(CFG.termsOfPaymentCell || 'C23').getValue() || ''),
       company_seal_no:       String(ctrl.getRange(CFG.companySealNoCell).getValue() || ''),
       shipping_line_seal_no: String(ctrl.getRange(CFG.shippingLineSealNoCell).getValue() || ''),
@@ -2227,6 +2244,7 @@
     };
 
     Logger.log('✅ Payload built | Vehicles: ' + vehicles.length + ' | Items: ' + items.length);
+    Logger.log('📋 NOTIFY FIELDS: notify_1="' + payload.notify_1 + '" | notify_2="' + payload.notify_2 + '"');
     Logger.log('💰 Financials: cif_usd=' + cif_usd + ' | total_inr=' + total_inr + ' | exchange_rate=' + payload.financials.exchange_rate);
     Logger.log('🚢 Shipping: port_load="' + payload.shipping.port_of_loading + '" | port_discharge="' + payload.shipping.port_of_discharge + '" | dest="' + payload.shipping.final_destination + '"');
     Logger.log('📄 PI fields: lc_number="' + payload.lc_number + '" | insurance_ref_no="' + payload.insurance_ref_no + '" | delivery_terms="' + payload.delivery_terms + '"');
@@ -3743,6 +3761,65 @@
       }
       range.setFormulas(formulas);
     }
+  }
+
+  // Calculates weighted average IGST rate across all vehicles based on their unit prices
+  // Returns 0 if no vehicles have a valid IGST rate
+  function calculateWeightedIgstRate_(vehicles) {
+    if (!vehicles || vehicles.length === 0) return 0;
+
+    var totalPrice = 0;
+    var weightedRate = 0;
+
+    vehicles.forEach(function(v) {
+      var price = Number(v.unit_price_usd) || 0;
+      var rate = Number(v.igst_rate) || 0;
+      totalPrice += price;
+      weightedRate += (price * rate);
+    });
+
+    if (totalPrice === 0) return 0;
+    return weightedRate / totalPrice;
+  }
+
+  // Applies IGST rate dropdown to Stock sheet col V, referencing Lookups!IGST Rates
+  // Same validation as CONTROL!F29, so each vehicle can have its own IGST rate
+  function applyIgstDropdownToSheet_(stockSheet) {
+    if (!stockSheet.getRange(1, STOCK_IGST_COL_).getValue()) stockSheet.getRange(1, STOCK_IGST_COL_).setValue('igst_rate');
+
+    var ss = stockSheet.getParent();
+    var lookups = ss.getSheetByName('Lookups');
+    if (!lookups) return;  // Silent fail if Lookups sheet doesn't exist
+
+    var lastRow = Math.max(lookups.getLastRow(), 2);
+    var headers = lookups.getRange(1, 1, 1, Math.max(lookups.getLastColumn(), 1)).getValues()[0];
+    var igstColIndex = -1;
+    for (var i = 0; i < headers.length; i++) {
+      if (String(headers[i] || '').trim().toLowerCase() === 'icst rates') {
+        igstColIndex = i + 1;  // 1-based
+        break;
+      }
+    }
+    if (igstColIndex === -1) return;  // Column not found
+
+    var igstRange = lookups.getRange(2, igstColIndex, lastRow - 1, 1);
+    var rule = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(igstRange, true)
+      .setAllowInvalid(true)
+      .setHelpText('Pick IGST rate or type a custom value. Falls back to CONTROL!F29 if blank.')
+      .build();
+
+    // Apply to rows 4-2000 (all data rows)
+    stockSheet.getRange(4, STOCK_IGST_COL_, 1997, 1).setDataValidation(rule);
+  }
+
+  // Applies IGST dropdown to all Stock sheets (legacy + monthly tabs)
+  function ensureIgstDropdownAllTabs_(ss) {
+    var legacy = ss.getSheetByName('Stock');
+    if (legacy) applyIgstDropdownToSheet_(legacy);
+    listStockTabNames_(ss).forEach(function(name) {
+      applyIgstDropdownToSheet_(ss.getSheetByName(name));
+    });
   }
 
   // Manual refresh for customer dropdowns — use this after bulk deleting customers from the Customers sheet

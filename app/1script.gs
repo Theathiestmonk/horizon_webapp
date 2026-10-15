@@ -44,9 +44,15 @@ function AMOUNTWORDS(n, curr) {
     if (x < 20)       return ones[x] || '';
     if (x < 100)      return tens[Math.floor(x/10)] + (x%10 ? ' '+ones[x%10] : '');
     if (x < 1000)     return ones[Math.floor(x/100)] + ' HUNDRED' + (x%100 ? ' AND '+words(x%100) : '');
-    if (x < 100000)   return words(Math.floor(x/1000)) + ' THOUSAND' + (x%1000 ? ' '+words(x%1000) : '');
-    if (x < 10000000) return words(Math.floor(x/100000)) + ' LAKH' + (x%100000 ? ' '+words(x%100000) : '');
-    return words(Math.floor(x/10000000)) + ' CRORE' + (x%10000000 ? ' '+words(x%10000000) : '');
+    if (curr === 'INR') {
+      if (x < 100000)   return words(Math.floor(x/1000)) + ' THOUSAND' + (x%1000 ? ' '+words(x%1000) : '');
+      if (x < 10000000) return words(Math.floor(x/100000)) + ' LAKH' + (x%100000 ? ' '+words(x%100000) : '');
+      return words(Math.floor(x/10000000)) + ' CRORE' + (x%10000000 ? ' '+words(x%10000000) : '');
+    }
+    if (x < 1000000)    return words(Math.floor(x/1000)) + ' THOUSAND' + (x%1000 ? ' '+words(x%1000) : '');
+    if (x < 1000000000) return words(Math.floor(x/1000000)) + ' MILLION' + (x%1000000 ? ' '+words(x%1000000) : '');
+    if (x < 1000000000000) return words(Math.floor(x/1000000000)) + ' BILLION' + (x%1000000000 ? ' '+words(x%1000000000) : '');
+    return words(Math.floor(x/1000000000000)) + ' TRILLION' + (x%1000000000000 ? ' '+words(x%1000000000000) : '');
   }
   const whole = Math.floor(Math.abs(n));
   const cents = Math.round((Math.abs(n) - whole) * 100);

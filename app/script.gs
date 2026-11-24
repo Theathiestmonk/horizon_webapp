@@ -71,7 +71,7 @@
     invoiceCodeCell:        'F17',
     webhookEnvironment: 'production', // Set to 'local' for testing against Cloudflare Tunnel; 'production' for live.
     webhookUrl: 'https://horizon-webapp.onrender.com/api/v1/invoices/',
-    localWebhookUrl: 'https://stage-compiled-six-attending.trycloudflare.com/api/v1/invoices/',
+    localWebhookUrl: 'https://whatever-content-requested-continually.trycloudflare.com/api/v1/invoices/',
   };
 
   // Every request uses one selected base URL, trimmed to avoid whitespace
@@ -1243,7 +1243,7 @@
     // showGenerationVehicleSelector's note on why row number, not chassis_no,
     // identifies a vehicle in the C17 selection below).
     var reservedRowPairs = [];
-    stock.getRange('A4:R2000').getValues().forEach(function(r, idx) {
+    stock.getRange('A4:V2000').getValues().forEach(function(r, idx) {
       if (String(r[6]).trim() === 'RESERVED' && sameInvoice_(r[invCol], inv)) {
         reservedRowPairs.push({ r: r, rowNum: idx + 4 });
       }
@@ -1258,6 +1258,22 @@
       if (filteredPairs.length > 0) reservedRowPairs = filteredPairs;
     }
     var reservedRows = reservedRowPairs.map(function(p) { return p.r; });
+
+    // Sync CONTROL!F29 (weighted IGST rate) and F30 (IGST amount INR) from
+    // per-vehicle col V rates whenever at least one vehicle carries a rate.
+    // This keeps the CONTROL display accurate without requiring manual entry.
+    (function syncIgstToControl() {
+      var hasRates = reservedRows.some(function(r) { return Number(r[21]) > 0; });
+      if (!hasRates) return;
+      var exRate = Number(ctrl.getRange(CFG.exchangeRateCell).getValue()) || 0;
+      var totalIgstInr = 0;
+      reservedRows.forEach(function(r) {
+        var price = Number(r[8]) || 0;   // col I = unit_price_usd
+        var rate  = Number(r[21]) || 0;  // col V = igst_rate
+        totalIgstInr += price * exRate * (rate / 100);
+      });
+      ctrl.getRange(CFG.igstAmountCell).setValue(totalIgstInr);
+    })();
 
     // Quantity (C26) and Total Packages (C34) only follow the selection when
     // the C17 checkbox picker is actually in use — at that point assignment
@@ -1955,6 +1971,14 @@
       if (it.quantity > 0) it.rate_per_unit = it.amount_usd / it.quantity;
     });
 
+    // Per-model IGST rate — weighted average of each vehicle's col V igst_rate,
+    // weighted by unit_price_usd. Falls back to CONTROL!F29 when no vehicle in
+    // the group has a col V value set.
+    var controlIgstRate = Number(ctrl.getRange(CFG.igstRateCell).getValue()) || 0;
+    items.forEach(function(it) {
+      it.igst_rate = calculateWeightedIgstRate_(it.vehicle_list) || controlIgstRate;
+    });
+
     // ── Per-vehicle HSN overrides (Stock cols R-T) — resolved into item-level
     // hsn_code_user_country / hsn_code_india / hsn_code_pi fields, since HSN
     // prints once per model group, not once per vehicle. Takes the first
@@ -2183,19 +2207,48 @@
         container_type:         ctrl.getRange(CFG.containerTypeCell).getValue() || ''
       },
 
-      financials: {
-        quantity:          quantityForPayload,
-        unit_price_usd:    Number(ctrl.getRange(CFG.unitPriceCell).getValue()) || 0,
-        fob_total_usd:     fobTotalUsd,
-        freight_usd:       Number(ctrl.getRange('F27').getValue()) || 0,
-        insurance_usd:     Number(ctrl.getRange('H27').getValue()) || 0,
-        cif_total_usd:     cif_usd,
-        exchange_rate:     Number(ctrl.getRange(CFG.exchangeRateCell).getValue()) || 0,
-        igst_rate:         calculateWeightedIgstRate_(vehicles) || Number(ctrl.getRange(CFG.igstRateCell).getValue()) || 0,
-        taxable_value_inr: Number(ctrl.getRange(CFG.taxableValueCell).getValue()) || 0,
-        igst_amount_inr:   Number(ctrl.getRange(CFG.igstAmountCell).getValue()) || 0,
-        total_value_inr:   total_inr
-      },
+      financials: (function() {
+        var exRate        = Number(ctrl.getRange(CFG.exchangeRateCell).getValue()) || 0;
+        var invoiceIgstRate = calculateWeightedIgstRate_(vehicles) || Number(ctrl.getRange(CFG.igstRateCell).getValue()) || 0;
+        var taxableInr    = Number(ctrl.getRange(CFG.taxableValueCell).getValue()) || 0;
+
+        // Per-vehicle IGST amounts — each vehicle contributes its own rate.
+        // igst_amount_inr is computed from actual vehicle prices + rates when
+        // possible (requires exchange_rate and at least one vehicle with a col V
+        // rate), otherwise falls back to whatever is typed in CONTROL!F30.
+        var computedIgstInr = 0;
+        var hasPerVehicleRates = vehicles.some(function(v) { return Number(v.igst_rate) > 0; });
+        if (exRate > 0 && hasPerVehicleRates) {
+          vehicles.forEach(function(v) {
+            var price = Number(v.unit_price_usd) || 0;
+            var rate  = Number(v.igst_rate) || invoiceIgstRate;
+            computedIgstInr += price * exRate * (rate / 100);
+          });
+        }
+        var igstAmountInr = computedIgstInr > 0
+          ? computedIgstInr
+          : (Number(ctrl.getRange(CFG.igstAmountCell).getValue()) || 0);
+
+        // Also stamp per-item igst_amount_inr so templates can print it per model row.
+        items.forEach(function(it) {
+          var itemRate = it.igst_rate || invoiceIgstRate;
+          it.igst_amount_inr = it.amount_usd * exRate * (itemRate / 100);
+        });
+
+        return {
+          quantity:          quantityForPayload,
+          unit_price_usd:    Number(ctrl.getRange(CFG.unitPriceCell).getValue()) || 0,
+          fob_total_usd:     fobTotalUsd,
+          freight_usd:       Number(ctrl.getRange('F27').getValue()) || 0,
+          insurance_usd:     Number(ctrl.getRange('H27').getValue()) || 0,
+          cif_total_usd:     cif_usd,
+          exchange_rate:     exRate,
+          igst_rate:         invoiceIgstRate,
+          taxable_value_inr: taxableInr,
+          igst_amount_inr:   igstAmountInr,
+          total_value_inr:   total_inr
+        };
+      })(),
 
       bank: {
         bank_name:  company.getRange('B8').getValue() || '',
@@ -3263,7 +3316,7 @@
     // PROFORMA/PI-only shipments). Row number (not chassis_no) is what
     // identifies each vehicle in the selection below — see parseC17SelectedRows_.
     const reservedPairs = [];
-    stock.getRange('A4:R2000').getValues().forEach(function(r, idx) {
+    stock.getRange('A4:V2000').getValues().forEach(function(r, idx) {
       if (sameInvoice_(r[invCol], invoice)) reservedPairs.push({ r: r, rowNum: idx + 4 });
     });
 
@@ -3282,13 +3335,21 @@
     const existingSelection = parseC17SelectedRows_(ctrl);
     const hasExistingSelection = !!existingSelection;
 
+    const controlIgstRate = Number(ctrl.getRange(CFG.igstRateCell).getValue()) || 0;
     const rows = reservedPairs.map(function(p) {
       const chassis = String(p.r[0] || '').trim();
       const chassisDisplay = chassis || '<span style="color:#94a3b8;font-style:italic">(no chassis assigned)</span>';
       const checked = hasExistingSelection ? !!existingSelection[String(p.rowNum)] : true;
+      const igstRate = Number(p.r[21]) || 0;  // col V (0-based index 21) = igst_rate
+      const igstDisplay = igstRate > 0
+        ? '<span style="background:#dcfce7;color:#15803d;padding:2px 6px;border-radius:4px;font-weight:700">' + igstRate + '%</span>'
+        : (controlIgstRate > 0
+          ? '<span style="color:#94a3b8;font-size:10px">↳ ' + controlIgstRate + '% (CTRL)</span>'
+          : '<span style="color:#94a3b8;font-size:10px">—</span>');
       return '<tr><td style="text-align:center"><input type="checkbox" class="vchk" data-row="' + p.rowNum + '" ' + (checked ? 'checked' : '') + '></td>' +
         '<td style="font-family:monospace;font-size:11px">' + chassisDisplay + '</td>' +
-        '<td>' + (p.r[2] || '') + '</td><td>' + (p.r[3] || '') + '</td></tr>';
+        '<td>' + (p.r[2] || '') + '</td><td>' + (p.r[3] || '') + '</td>' +
+        '<td style="text-align:center">' + igstDisplay + '</td></tr>';
     }).join('');
 
     const html = HtmlService.createHtmlOutput(
@@ -3310,7 +3371,7 @@
       '</style>' +
       '<div class="header"><h3>🎯 Select Vehicles for Generation</h3>' +
       '<p>Invoice: <strong>' + invoice + '</strong> &nbsp;·&nbsp; ' + reservedPairs.length + ' vehicle(s) reserved</p></div>' +
-      '<table><thead><tr><th>✓</th><th>Chassis No.</th><th>Model</th><th>Colour</th></tr></thead>' +
+      '<table><thead><tr><th>✓</th><th>Chassis No.</th><th>Model</th><th>Colour</th><th style="text-align:center">IGST Rate</th></tr></thead>' +
       '<tbody>' + rows + '</tbody></table>' +
       '<button class="btn" id="saveBtn" onclick="save()">Apply Selection to C17</button>' +
       '<button class="btn-clear" onclick="clearSel()">Clear (include all reserved vehicles)</button>' +

@@ -871,6 +871,13 @@ def build_context(payload: Any, template_name: str = "") -> Dict[str, Any]:
             # Ensure HSN fields exist
             for hsn_key in ['hsn_code', 'hsn_code_pi', 'hsn_code_india', 'hsn_code_user_country']:
                 it.setdefault(hsn_key, '')
+            # Per-model IGST rate from Stock col V — falls back to invoice-level
+            # igst_rate (financials) so templates can use {{ item.igst_rate }} /
+            # {{ item.igst_percent }} for a per-model rate, or the top-level
+            # {{ igst_rate }} / {{ igst_percent }} for the invoice-level average.
+            it.setdefault('igst_rate', context.get('igst_rate', 0))
+            it['igst_percent'] = it.get('igst_rate') or 0
+            it.setdefault('igst_amount_inr', 0)
 
     # ── total_quantity across all items ─────────────────────────────────────
     context['total_quantity'] = sum(
